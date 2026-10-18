@@ -1,0 +1,48 @@
+<Window x:Class="GctFov.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="GCT · FOV" Width="470" Height="345" ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen" Background="#141821"
+        Foreground="#F3F5FA" FontFamily="Segoe UI" FontSize="14"
+        Loaded="WindowLoaded" Closing="WindowClosing">
+    <Grid Margin="28,22,28,20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+        <DockPanel>
+            <TextBlock Text="Genshin · FOV" FontSize="21" FontWeight="SemiBold" VerticalAlignment="Center"/>
+            <TextBlock x:Name="FovNumber" Text="—" FontSize="30" FontWeight="SemiBold"
+                       Foreground="#8FB7FF" HorizontalAlignment="Right" AutomationProperties.AutomationId="FovNumber"/>
+        </DockPanel>
+        <Slider x:Name="FovSlider" Grid.Row="1" Margin="0,22,0,4"
+                Minimum="1" Maximum="179" Value="45" TickFrequency="1"
+                IsSnapToTickEnabled="True" IsEnabled="False" Focusable="True"
+                AutoToolTipPlacement="TopLeft" AutoToolTipPrecision="0"
+                SelectionStart="1" IsSelectionRangeEnabled="True"
+                ValueChanged="FovChanged" AutomationProperties.AutomationId="FovSlider"/>
+        <DockPanel Grid.Row="2" Margin="0,0,0,18">
+            <TextBlock Text="1°" Foreground="#929BAE" FontSize="12"/>
+            <TextBlock Text="179°" Foreground="#929BAE" FontSize="12" HorizontalAlignment="Right"/>
+        </DockPanel>
+        <StackPanel Grid.Row="3" Margin="0,0,0,14">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="FPS" VerticalAlignment="Center" Margin="0,0,12,0"/>
+                <TextBox x:Name="FpsInput" Width="80" Text="120" IsEnabled="False"
+                         VerticalContentAlignment="Center" Padding="6,3"/>
+                <Button x:Name="ApplyFpsButton" Content="Áp dụng FPS" Click="ApplyFpsClick"
+                        IsEnabled="False" Margin="12,0,0,0" Padding="12,5"/>
+            </StackPanel>
+            <TextBlock x:Name="FpsStatus" Foreground="#BCC5D7" FontSize="12" Margin="0,6,0,0" TextWrapping="Wrap"/>
+        </StackPanel>
+        <StackPanel Grid.Row="4" VerticalAlignment="Bottom">
+            <TextBlock x:Name="Status" Text="Đang đọc FOV…" Foreground="#BCC5D7"
+                       TextWrapping="Wrap" AutomationProperties.AutomationId="Status"/>
+            <TextBlock Text="Có hiệu lực khi plugin FOV đang chạy trong game."
+                       Foreground="#818CA3" FontSize="11" Margin="0,7,0,0"/>
+        </StackPanel>
+    </Grid>
+</Window>
