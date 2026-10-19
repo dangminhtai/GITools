@@ -1,0 +1,1719 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0d86ff7..032f2e9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -89,3 +89,44 @@ target_link_libraries(plugin
+     PRIVATE WIL::WIL
+     PRIVATE util
+ )
++
++# Observation only. Never deploy this experimental DLL as verified FreeCam.
++option(GCT_NATIVE_POSE_OBSERVER "Build hash-pinned, passive native pose observer" OFF)
++if (GCT_NATIVE_POSE_OBSERVER)
++    target_compile_definitions(plugin PRIVATE GCT_NATIVE_POSE_OBSERVER=1)
++    target_link_libraries(plugin PRIVATE bcrypt.lib)
++endif()
++
++# Explicit, bounded visual trial using a copy of the position setter argument.
++# Does not enable the legacy owner/source-write path or claim verified FreeCam.
++option(GCT_NATIVE_ARGUMENT_TRIAL "Build opt-in three-second native X argument visual trial" OFF)
++if (GCT_NATIVE_ARGUMENT_TRIAL)
++    if (NOT GCT_NATIVE_POSE_OBSERVER)
++        message(FATAL_ERROR "GCT_NATIVE_ARGUMENT_TRIAL requires GCT_NATIVE_POSE_OBSERVER=ON")
++    endif()
++    target_compile_definitions(plugin PRIVATE GCT_NATIVE_ARGUMENT_TRIAL=1)
++endif()
++
++# Experimental native write path; separate from observer-only builds.
++# Keeps observer enabled, and DOES NOT deploy or run any loader.
++option(GCT_NATIVE_POSE_EXPERIMENT "Compile explicit one-axis, short-lived pose experiment" OFF)
++if (GCT_NATIVE_POSE_EXPERIMENT)
++    if (NOT GCT_NATIVE_POSE_OBSERVER)
++        message(FATAL_ERROR "GCT_NATIVE_POSE_EXPERIMENT requires GCT_NATIVE_POSE_OBSERVER=ON")
++    endif()
++    target_compile_definitions(plugin PRIVATE GCT_NATIVE_POSE_EXPERIMENT=1)
++endif()
++
++# Isolated unit tests of FreeCam's motion & lifecycle. Explicitly opt in:
++# cmake -S . -B build -DGCT_BUILD_CAMERA_TESTS=ON ...
++# This does not validate a native Genshin camera backend.
++option(GCT_BUILD_CAMERA_TESTS "Build standalone FreeCam core tests" OFF)
++if (GCT_BUILD_CAMERA_TESTS)
++    enable_testing()
++    add_executable(gct_freecam_core_tests
++        tests/freecam_core_tests.cpp
++        src/plugin/camera/FreeCamCore.cpp
++    )
++    target_include_directories(gct_freecam_core_tests PRIVATE include)
++    add_test(NAME gct_freecam_core_tests COMMAND gct_freecam_core_tests)
++endif()
+diff --git a/include/plugin/Plugin.hpp b/include/plugin/Plugin.hpp
+index 4b78433..052ac98 100644
+--- a/include/plugin/Plugin.hpp
++++ b/include/plugin/Plugin.hpp
+@@ -7,6 +7,10 @@
+ #include "plugin/components/VirtualKeyState.hpp"
+ #include "plugin/interfaces/ComponentBase.hpp"
+ 
++#if defined(GCT_NATIVE_POSE_OBSERVER)
++#include "plugin/camera/NativePoseHook.hpp"
++#endif
++
+ #include <filesystem>
+ 
+ namespace z3lx::plugin {
+@@ -16,6 +20,9 @@ class Plugin final : public ComponentBase<
+     FovUnlocker,
+     PersistentObject<Config>,
+     VirtualKeyState
++#if defined(GCT_NATIVE_POSE_OBSERVER)
++    , camera::NativePoseHook
++#endif
+ > {
+ public:
+     explicit Plugin(std::filesystem::path configFilePath);
+diff --git a/include/plugin/camera/FreeCamCore.hpp b/include/plugin/camera/FreeCamCore.hpp
+new file mode 100644
+index 0000000..5556d64
+--- /dev/null
++++ b/include/plugin/camera/FreeCamCore.hpp
+@@ -0,0 +1,95 @@
++#pragma once
++
++// GCT FreeCam motion/state core. No Genshin offsets, DLL loading, hooks, or Unity API.
++// This code MUST only be called by a verified render/main-thread backend.
++// The IFrameCamera implementation owns game-camera detach, input ownership,
++// projection/pose writes, world shifts, and COMPLETE restore.
++
++#include <thread>
++
++namespace z3lx::plugin::camera {
++
++struct Vec3 { float x = 0, y = 0, z = 0; };
++struct Quaternion { float w = 1, x = 0, y = 0, z = 0; };
++struct CameraPose {
++    Vec3 position {};
++    Quaternion rotation {};
++};
++
++struct Input {
++    // All movement axes range from -1 to +1, in CAMERA-LOCAL coordinates.
++    float right = 0;
++    float up = 0;
++    float forward = 0;
++    // Look axes are -1..+1; positive yaw turns towards +X from forward +Z.
++    float yaw = 0;
++    float pitch = 0;
++    float roll = 0;
++    bool fast = false;
++    bool slow = false;
++};
++
++struct Settings {
++    float speed = 6.0f;        // scene units per second
++    float turnSpeed = 90.0f;   // degrees per second
++    float fastMultiplier = 4.0f;
++    float slowMultiplier = 0.25f;
++};
++
++enum class Result {
++    Ok,
++    AlreadyEnabled,
++    NotEnabled,
++    BackendUnavailable,
++    InvalidPose,
++    InvalidInput,
++    WrongThread,
++    ApplyFailed,
++    RestoreFailed
++};
++
++class IFrameCamera {
++public:
++    virtual ~IFrameCamera() = default;
++
++    // Strong thread gate; must be based on a VERIFIED native callback.
++    virtual bool IsOnRenderThread() const noexcept = 0;
++    // Acquire verified LIVE main-camera ownership and snapshot all game state.
++    // Do not succeed until the native camera/transform ABI and lifecycle are known.
++    virtual bool Begin(CameraPose& currentPose) noexcept = 0;
++    // Called exclusively from the game's valid render/main-thread callback.
++    // MUST NOT change FOV: original z3lx FOV module retains ownership.
++    virtual bool Apply(const CameraPose& pose) noexcept = 0;
++    // Restore game camera binding, gameplay input, projection and original state.
++    // Must remain retryable on failure. Returning true means restoration confirmed.
++    virtual bool Restore() noexcept = 0;
++};
++
++class FreeCamCore final {
++public:
++    explicit FreeCamCore(Settings settings = {}) noexcept;
++
++    [[nodiscard]] Result Start(IFrameCamera& backend) noexcept;
++    [[nodiscard]] Result Tick(Input input, float deltaSeconds) noexcept;
++    [[nodiscard]] Result ResetPose() noexcept;
++    [[nodiscard]] Result Stop() noexcept;
++
++    [[nodiscard]] bool Active() const noexcept { return active_; }
++    [[nodiscard]] const CameraPose& Pose() const noexcept { return pose_; }
++    [[nodiscard]] Result LastResult() const noexcept { return last_; }
++
++private:
++    [[nodiscard]] bool OnOwnerThread() const noexcept;
++    [[nodiscard]] Result RecoverFromApplyFailure() noexcept;
++
++    Settings settings_ {};
++    CameraPose pose_ {};
++    CameraPose initial_ {};
++    IFrameCamera* backend_ = nullptr;
++    std::thread::id ownerThread_ {};
++    Result last_ = Result::NotEnabled;
++    bool active_ = false;
++    bool restoreOnly_ = false;
++};
++
++} // namespace z3lx::plugin::camera
+diff --git a/include/plugin/camera/NativeArgumentTrial.hpp b/include/plugin/camera/NativeArgumentTrial.hpp
+new file mode 100644
+index 0000000..92099f4
+--- /dev/null
++++ b/include/plugin/camera/NativeArgumentTrial.hpp
+@@ -0,0 +1,76 @@
++#pragma once
++#if defined(GCT_NATIVE_ARGUMENT_TRIAL)
++#include <Windows.h>
++#include <array>
++#include <atomic>
++#include <cstdint>
++#include <filesystem>
++#include <span>
++#include <string>
++
++namespace z3lx::plugin::camera {
++// These are observations, NOT a main-camera identity or lifetime lease.
++struct TrialBinding {
++    std::uintptr_t owner = 0, target = 0, camera = 0;
++    DWORD thread = 0;
++    LONGLONG last = 0;
++    bool valid = false;
++    std::array<float, 3> position {};
++};
++
++// Explicitly authorized visual probe, separate from FreeCamCore's verified
++// takeover contract. Never writes owner/source state, FOV or input; only the
++// selected original pose setter consumes a call-local argument copy.
++class NativeArgumentTrial final {
++public:
++    struct Ticket { std::uint64_t generation = 0; bool replaced = false; };
++    void Initialize(std::filesystem::path directory, LONGLONG session, LONGLONG frequency);
++    void Poll(std::span<const TrialBinding> bindings, LONGLONG now);
++    Ticket Prepare(std::uintptr_t owner, void* target, unsigned depth,
++                   const std::array<float, 3>& source, std::array<float, 3>& copy) noexcept;
++    Ticket PrepareRotation(std::uintptr_t owner, void* target, unsigned depth,
++                   const std::array<float, 4>& source, std::array<float, 4>& copy) noexcept;
++    void Returned(Ticket ticket) noexcept;
++    void IoFailed() noexcept;
++
++private:
++    enum class Phase { Idle, WaitingFocus, Active, Completed, Stopped, Rejected };
++    enum class PositionMode { Axis, Absolute, Offset, Keyboard };
++    struct Control {
++        Phase phase = Phase::Idle;
++        const char* reason = "no_request";
++        std::uint64_t generation = 0, replaced = 0, forwarded = 0;
++        TrialBinding binding {};
++        LONGLONG waitUntil = 0, expires = 0, lastReplaced = 0, lastForwarded = 0;
++        float dx = 0, sourceX = 0, appliedX = 0;
++        unsigned axis = 0;
++        float sourceComponent = 0, appliedComponent = 0;
++        bool hasRotationAnchor = false;
++        std::array<float, 4> rotationAnchor {}, sourceRotation {}, appliedRotation {};
++        PositionMode positionMode = PositionMode::Axis;
++        bool hasPositionTarget = false;
++        std::array<float, 3> requestedPosition {}, positionTarget {}, sourcePosition {}, appliedPosition {};
++        float speed = 3;
++        LONGLONG movementTick = 0;
++        bool hasMovementRotation = false;
++        std::array<float, 4> movementRotation {};
++    } control_;
++    std::atomic_flag lock_ = ATOMIC_FLAG_INIT;
++    std::filesystem::path directory_;
++    LONGLONG session_ = 0, frequency_ = 0;
++    std::string lastCommand_, nonce_;
++    bool hadRequest_ = false;
++    // The owning observer and plugin are retained/pinned until process exit.
++    std::atomic<unsigned> keyboardKeys_ {0};
++    std::atomic<unsigned> keyboardReleaseFirst_ {0};
++    std::atomic<LONGLONG> keyboardLease_ {0};
++    std::atomic<bool> keyboardStop_ {false}, keyboardReady_ {false};
++    bool keyboardStarted_ = false;
++    void StartKeyboard();
++    static LRESULT CALLBACK KeyboardProc(int code, WPARAM message, LPARAM data) noexcept;
++    void Cancel(Phase phase, const char* reason) noexcept;
++    void Command(const std::string& command, std::span<const TrialBinding> bindings, LONGLONG now);
++    void Save(std::span<const TrialBinding> bindings, LONGLONG now);
++};
++}
++#endif
+diff --git a/include/plugin/camera/NativePoseHook.hpp b/include/plugin/camera/NativePoseHook.hpp
+new file mode 100644
+index 0000000..95f38dc
+--- /dev/null
++++ b/include/plugin/camera/NativePoseHook.hpp
+@@ -0,0 +1,23 @@
++#pragma once
++
++#include "plugin/interfaces/ComponentBase.hpp"
++
++namespace z3lx::plugin::camera {
++namespace detail { struct PoseObserverState; }
++
++// Observer by default. EXPERIMENT requests are rejected until a verified native
++// camera/callback/pose contract exists; the current fork has no such binding.
++// No camera identity or render-thread assertion; FreeCamCore is not connected.
++// GCT_NATIVE_ARGUMENT_TRIAL separately provides an explicitly requested visual
++// probe using a call-local setter-argument copy; it does not verify that contract.
++class NativePoseHook final : public ComponentBase<NativePoseHook> {
++public:
++    void Start() noexcept;
++    void Update() noexcept;
++
++private:
++    // Process-lifetime trampoline storage; the observing DLL is pinned before enable.
++    // Hot unload/reconfiguration is deliberately unsupported.
++    detail::PoseObserverState* state_ = nullptr;
++};
++} // namespace z3lx::plugin::camera
+diff --git a/scripts/test-freecam-core.ps1 b/scripts/test-freecam-core.ps1
+new file mode 100644
+index 0000000..683acae
+--- /dev/null
++++ b/scripts/test-freecam-core.ps1
+@@ -0,0 +1,21 @@
++# Run in an x64 Native Tools Command Prompt (or PowerShell initialized for MSVC).
++# Compiles only pure FreeCam core/tests; never runs Genshin or a mod loader.
++$ErrorActionPreference = 'Stop'
++$root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
++$build = Join-Path $root '.camera-test-build'
++New-Item -ItemType Directory -Force -Path $build | Out-Null
++if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
++    throw 'MSVC cl.exe not available. Start an x64 Native Tools for VS 2022 terminal.'
++}
++Push-Location $build
++try {
++    & cl.exe /nologo /std:c++20 /EHsc "/I$root\include" `
++        "$root\src\plugin\camera\FreeCamCore.cpp" `
++        "$root\tests\freecam_core_tests.cpp" `
++        /Fe:gct-freecam-tests.exe
++    if ($LASTEXITCODE -ne 0) { throw "Compilation failed ($LASTEXITCODE)" }
++    & '.\gct-freecam-tests.exe'
++    if ($LASTEXITCODE -ne 0) { throw "Tests failed ($LASTEXITCODE)" }
++} finally {
++    Pop-Location
++}
+diff --git a/src/plugin/camera/FreeCamCore.cpp b/src/plugin/camera/FreeCamCore.cpp
+new file mode 100644
+index 0000000..99a55fd
+--- /dev/null
++++ b/src/plugin/camera/FreeCamCore.cpp
+@@ -0,0 +1,153 @@
++#include "plugin/camera/FreeCamCore.hpp"
++
++#include <algorithm>
++#include <cmath>
++#include <numbers>
++
++namespace z3lx::plugin::camera {
++namespace {
++constexpr float pi = std::numbers::pi_v<float>;
++constexpr float eps = 1.e-6f;
++
++bool Finite(float value) noexcept { return std::isfinite(value); }
++bool Finite(Vec3 v) noexcept { return Finite(v.x) && Finite(v.y) && Finite(v.z); }
++bool Finite(Quaternion q) noexcept {
++    return Finite(q.w) && Finite(q.x) && Finite(q.y) && Finite(q.z);
++}
++bool Valid(CameraPose pose) noexcept {
++    auto q = pose.rotation;
++    float len2 = q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z;
++    return Finite(pose.position) && Finite(q) && len2 > eps;
++}
++
++Vec3 operator+(Vec3 a, Vec3 b) noexcept { return {a.x+b.x, a.y+b.y, a.z+b.z}; }
++Vec3 operator*(Vec3 a, float s) noexcept { return {a.x*s, a.y*s, a.z*s}; }
++
++Quaternion Mul(Quaternion a, Quaternion b) noexcept {
++    return {
++        a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z,
++        a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
++        a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
++        a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w
++    };
++}
++Quaternion Normalize(Quaternion q) noexcept {
++    float length = std::sqrt(q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z);
++    return {q.w/length, q.x/length, q.y/length, q.z/length};
++}
++Quaternion AxisAngle(Vec3 axis, float degrees) noexcept {
++    float half = degrees * pi / 360.f;
++    float s = std::sin(half);
++    return {std::cos(half), axis.x*s, axis.y*s, axis.z*s};
++}
++Vec3 Rotate(Quaternion q, Vec3 v) noexcept {
++    // Normalize quaternion before use. Quaternion->matrix avoids 2 temporaries.
++    float xx=q.x*q.x, yy=q.y*q.y, zz=q.z*q.z;
++    float xy=q.x*q.y, xz=q.x*q.z, yz=q.y*q.z;
++    float wx=q.w*q.x, wy=q.w*q.y, wz=q.w*q.z;
++    return {
++        (1-2*(yy+zz))*v.x + 2*(xy-wz)*v.y + 2*(xz+wy)*v.z,
++        2*(xy+wz)*v.x + (1-2*(xx+zz))*v.y + 2*(yz-wx)*v.z,
++        2*(xz-wy)*v.x + 2*(yz+wx)*v.y + (1-2*(xx+yy))*v.z
++    };
++}
++float ClampAxis(float v) noexcept { return std::clamp(v, -1.f, 1.f); }
++bool ValidInput(Input i, float dt) noexcept {
++    return Finite(dt) && dt > 0.f && dt <= 0.25f &&
++           Finite(i.right) && Finite(i.up) && Finite(i.forward) &&
++           Finite(i.yaw) && Finite(i.pitch) && Finite(i.roll);
++}
++} // namespace
++
++FreeCamCore::FreeCamCore(Settings settings) noexcept : settings_(settings) {
++    if (!Finite(settings_.speed) || settings_.speed <= 0.f) settings_.speed = 6.f;
++    if (!Finite(settings_.turnSpeed) || settings_.turnSpeed <= 0.f) settings_.turnSpeed = 90.f;
++    if (!Finite(settings_.fastMultiplier) || settings_.fastMultiplier < 1.f) settings_.fastMultiplier = 4.f;
++    if (!Finite(settings_.slowMultiplier) || settings_.slowMultiplier <= 0.f || settings_.slowMultiplier > 1.f) settings_.slowMultiplier = .25f;
++}
++
++bool FreeCamCore::OnOwnerThread() const noexcept {
++    return ownerThread_ == std::this_thread::get_id();
++}
++
++Result FreeCamCore::Start(IFrameCamera& backend) noexcept {
++    if (active_) return last_ = Result::AlreadyEnabled;
++    if (!backend.IsOnRenderThread()) return last_ = Result::WrongThread;
++    CameraPose current {};
++    if (!backend.Begin(current)) return last_ = Result::BackendUnavailable;
++    backend_ = &backend;
++    ownerThread_ = std::this_thread::get_id();
++    active_ = true;
++    restoreOnly_ = false;
++    if (!Valid(current)) {
++        // Session was acquired but invalid: restoration is still obligatory.
++        restoreOnly_ = true;
++        if (!backend.Restore()) return last_ = Result::RestoreFailed;
++        backend_ = nullptr; active_ = false; restoreOnly_ = false;
++        return last_ = Result::InvalidPose;
++    }
++    pose_ = initial_ = current;
++    pose_.rotation = Normalize(pose_.rotation);
++    initial_.rotation = pose_.rotation;
++    return last_ = Result::Ok;
++}
++
++Result FreeCamCore::RecoverFromApplyFailure() noexcept {
++    restoreOnly_ = true;
++    if (!backend_->Restore()) return last_ = Result::RestoreFailed;
++    active_ = false;
++    restoreOnly_ = false;
++    backend_ = nullptr;
++    return last_ = Result::ApplyFailed;
++}
++
++Result FreeCamCore::Tick(Input input, float deltaSeconds) noexcept {
++    if (!active_) return last_ = Result::NotEnabled;
++    if (!OnOwnerThread() || !backend_->IsOnRenderThread()) return last_ = Result::WrongThread;
++    if (restoreOnly_) return last_ = Result::RestoreFailed;
++    if (!ValidInput(input, deltaSeconds)) return last_ = Result::InvalidInput;
++
++    float speed = settings_.speed * (input.fast ? settings_.fastMultiplier : 1.f) *
++                  (input.slow ? settings_.slowMultiplier : 1.f);
++    float degrees = settings_.turnSpeed * deltaSeconds;
++    Quaternion rotation = pose_.rotation;
++    rotation = Mul(AxisAngle({0,1,0}, ClampAxis(input.yaw)*degrees), rotation);
++    rotation = Mul(rotation, AxisAngle({1,0,0}, -ClampAxis(input.pitch)*degrees));
++    rotation = Mul(rotation, AxisAngle({0,0,1}, ClampAxis(input.roll)*degrees));
++    rotation = Normalize(rotation);
++
++    Vec3 motion {ClampAxis(input.right), ClampAxis(input.up), ClampAxis(input.forward)};
++    float motionLength = std::sqrt(motion.x*motion.x + motion.y*motion.y + motion.z*motion.z);
++    if (motionLength > 1.f) motion = motion * (1.f / motionLength);
++    CameraPose next = pose_;
++    next.rotation = rotation;
++    next.position = next.position + Rotate(rotation, motion) * (speed * deltaSeconds);
++    // FOV is not part of CameraPose. Existing z3lx FOV logic remains sole owner.
++    if (!Valid(next)) return last_ = Result::InvalidPose;
++    if (!backend_->Apply(next)) return RecoverFromApplyFailure();
++    pose_ = next;
++    return last_ = Result::Ok;
++}
++
++Result FreeCamCore::ResetPose() noexcept {
++    if (!active_) return last_ = Result::NotEnabled;
++    if (!OnOwnerThread() || !backend_->IsOnRenderThread()) return last_ = Result::WrongThread;
++    if (restoreOnly_) return last_ = Result::RestoreFailed;
++    // No fake world-origin compensation: the native backend must handle it.
++    if (!backend_->Apply(initial_)) return RecoverFromApplyFailure();
++    pose_ = initial_;
++    return last_ = Result::Ok;
++}
++
++Result FreeCamCore::Stop() noexcept {
++    if (!active_) return last_ = Result::NotEnabled;
++    if (!OnOwnerThread() || !backend_->IsOnRenderThread()) return last_ = Result::WrongThread;
++    restoreOnly_ = true;
++    if (!backend_->Restore()) return last_ = Result::RestoreFailed;
++    active_ = false;
++    restoreOnly_ = false;
++    backend_ = nullptr;
++    return last_ = Result::Ok;
++}
++
++} // namespace z3lx::plugin::camera
+diff --git a/src/plugin/camera/NativeArgumentTrial.cpp b/src/plugin/camera/NativeArgumentTrial.cpp
+new file mode 100644
+index 0000000..2defc72
+--- /dev/null
++++ b/src/plugin/camera/NativeArgumentTrial.cpp
+@@ -0,0 +1,458 @@
++#if defined(GCT_NATIVE_ARGUMENT_TRIAL)
++#include "plugin/camera/NativeArgumentTrial.hpp"
++#include <algorithm>
++#include <cmath>
++#include <fstream>
++#include <future>
++#include <iomanip>
++#include <locale>
++#include <sstream>
++#include <stdexcept>
++#include <system_error>
++#include <thread>
++
++namespace z3lx::plugin::camera {
++namespace {
++NativeArgumentTrial* keyboardOwner = nullptr;
++unsigned KeyBit(DWORD key) noexcept {
++    switch (key) {
++    case VK_UP: return 1u << 1;
++    case VK_DOWN: return 1u << 3;
++    case VK_LEFT: return 1u << 5;
++    case VK_RIGHT: return 1u << 7;
++    case VK_PRIOR: return 1u << 8; // Page Up: scene up
++    case VK_NEXT: return 1u << 9;  // Page Down: scene down
++    default: return 0;
++    }
++}
++bool GameFocused() noexcept {
++    DWORD pid = 0;
++    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
++    CURSORINFO cursor {sizeof(CURSORINFO)};
++    return pid == GetCurrentProcessId() && GetCursorInfo(&cursor) && !(cursor.flags & CURSOR_SHOWING);
++}
++void Acquire(std::atomic_flag& flag) noexcept {
++    while (flag.test_and_set(std::memory_order_acquire)) std::this_thread::yield();
++}
++bool Recent(const TrialBinding& b, LONGLONG now, LONGLONG frequency) noexcept {
++    return b.valid && b.owner && b.target && b.camera && b.thread &&
++        b.last <= now && now - b.last < frequency * 2;
++}
++bool FinitePosition(const std::array<float, 3>& value) noexcept {
++    return std::all_of(value.begin(), value.end(), [](float v) { return std::isfinite(v); });
++}
++std::uintptr_t Pointer(const std::string& text) {
++    std::size_t used = 0;
++    const auto value = std::stoull(text, &used, 16);
++    if (!value || used != text.size()) throw std::runtime_error("invalid_pointer");
++    return static_cast<std::uintptr_t>(value);
++}
++}
++
++void NativeArgumentTrial::StartKeyboard() {
++    if (keyboardStarted_) {
++        if (!keyboardReady_.load()) throw std::runtime_error("keyboard_hook_unavailable");
++        return;
++    }
++    keyboardStarted_ = true;
++    auto ready = std::make_shared<std::promise<bool>>();
++    auto result = ready->get_future();
++    std::thread([this, ready] {
++        HMODULE module = nullptr;
++        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++            reinterpret_cast<LPCWSTR>(KeyboardProc), &module);
++        keyboardOwner = this;
++        const auto hook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, module, 0);
++        keyboardReady_.store(hook != nullptr);
++        ready->set_value(hook != nullptr);
++        if (!hook) return;
++        MSG message {};
++        while (GetMessageW(&message, nullptr, 0, 0) > 0) {
++            TranslateMessage(&message); DispatchMessageW(&message);
++        }
++        UnhookWindowsHookEx(hook);
++        keyboardReady_.store(false);
++        keyboardKeys_.store(0);
++        keyboardLease_.store(0);
++    }).detach();
++    if (result.wait_for(std::chrono::seconds(2)) != std::future_status::ready || !result.get())
++        throw std::runtime_error("keyboard_hook_unavailable");
++}
++
++LRESULT CALLBACK NativeArgumentTrial::KeyboardProc(int code, WPARAM message, LPARAM data) noexcept {
++    auto* self = keyboardOwner;
++    if (code < 0 || !self) return CallNextHookEx(nullptr, code, message, data);
++    const auto& key = *reinterpret_cast<const KBDLLHOOKSTRUCT*>(data);
++    LARGE_INTEGER now {}; QueryPerformanceCounter(&now);
++    const bool down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
++    const bool up = message == WM_KEYUP || message == WM_SYSKEYUP;
++    const bool armed = now.QuadPart < self->keyboardLease_.load();
++    DWORD foreground = 0; GetWindowThreadProcessId(GetForegroundWindow(), &foreground);
++    if (armed && foreground == GetCurrentProcessId() && key.vkCode == VK_F8 && down) {
++        self->keyboardStop_.store(true); self->keyboardLease_.store(0); self->keyboardKeys_.store(0);
++        return 1;
++    }
++    const bool shortcut = (key.flags & LLKHF_ALTDOWN) ||
++        (GetAsyncKeyState(VK_CONTROL) & 0x8000) || (GetAsyncKeyState(VK_LWIN) & 0x8000) ||
++        (GetAsyncKeyState(VK_RWIN) & 0x8000);
++    if (!armed || !GameFocused() || shortcut || key.vkCode == VK_MENU || key.vkCode == VK_LMENU || key.vkCode == VK_RMENU) {
++        self->keyboardKeys_.store(0);
++        return CallNextHookEx(nullptr, code, message, data);
++    }
++    const auto bit = KeyBit(key.vkCode);
++    if (bit && (self->keyboardReleaseFirst_.load() & bit)) {
++        // A key pressed before takeover belongs to gameplay. Forward its release
++        // before accepting a fresh press for camera control (no stuck game key).
++        if (up) self->keyboardReleaseFirst_.fetch_and(~bit);
++        return CallNextHookEx(nullptr, code, message, data);
++    }
++    // No disk IO, logging, blocking locks or engine calls on the input thread.
++    if (bit && !(key.flags & LLKHF_INJECTED) && (down || up)) {
++        if (down) self->keyboardKeys_.fetch_or(bit);
++        else self->keyboardKeys_.fetch_and(~bit);
++        return 1;
++    }
++    return CallNextHookEx(nullptr, code, message, data);
++}
++
++void NativeArgumentTrial::Initialize(std::filesystem::path directory, LONGLONG session, LONGLONG frequency) {
++    directory_ = std::move(directory); session_ = session; frequency_ = frequency;
++}
++
++void NativeArgumentTrial::Cancel(Phase phase, const char* reason) noexcept {
++    keyboardLease_.store(0); keyboardKeys_.store(0);
++    Acquire(lock_);
++    control_.phase = phase;
++    control_.reason = reason;
++    lock_.clear(std::memory_order_release);
++}
++
++void NativeArgumentTrial::Command(const std::string& command, std::span<const TrialBinding> bindings, LONGLONG now) {
++    Acquire(lock_); const auto previous = control_; lock_.clear(std::memory_order_release);
++    // Every changed command revokes the previous override, even if malformed.
++    Cancel(Phase::Rejected, "invalid_request");
++    std::istringstream in(command);
++    in.imbue(std::locale::classic());
++    std::string magic, extra;
++    unsigned long long pid = 0, session = 0;
++    if (!(in >> magic >> pid >> session) || pid != GetCurrentProcessId() ||
++        session != static_cast<unsigned long long>(session_)) return;
++    if (magic == "GCTARGXSTOP1") {
++        if (in >> extra) return;
++        Cancel(Phase::Stopped, "user_stop");
++        return;
++    }
++    std::string ownerText, targetText, cameraText, nonce;
++    unsigned long long thread = 0;
++    float dx = 0;
++    unsigned axis = 0;
++    const bool absolute = magic == "GCTARGABS2", offset = magic == "GCTARGOFFSET2";
++    const bool keyboard = magic == "GCTARGMOVE2";
++    const bool custom = absolute || offset;
++    float speed = 3;
++    std::array<float, 3> requestedPosition {};
++    if ((!custom && !keyboard && magic != "GCTARGPOSE2") ||
++        !(in >> ownerText >> thread >> targetText >> cameraText >> nonce)) return;
++    if (keyboard) {
++        if (!(in >> speed) || !std::isfinite(speed) || speed <= 0) return;
++        StartKeyboard();
++    } else if (custom) {
++        if (!(in >> requestedPosition[0] >> requestedPosition[1] >> requestedPosition[2]) || !FinitePosition(requestedPosition)) return;
++    } else {
++        if (magic != "GCTARGX1" && !(in >> axis)) return;
++        if (!(in >> dx) || axis > 4 || (magic != "GCTARGPOSE2" && axis > 2) ||
++            !std::isfinite(dx) || dx == 0 || std::abs(dx) > (axis < 3 ? 0.25f : 5.0f)) return;
++    }
++    if ((in >> extra) || thread == 0 || thread > 0xffffffffull || nonce.size() != 32 || nonce == nonce_ ||
++        nonce.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) return;
++    std::uintptr_t owner = 0, target = 0, camera = 0;
++    try { owner = Pointer(ownerText); target = Pointer(targetText); camera = Pointer(cameraText); }
++    catch (...) { return; }
++    const TrialBinding* match = nullptr;
++    unsigned recentCount = 0;
++    for (const auto& b : bindings) {
++        if (!Recent(b, now, frequency_)) continue;
++        ++recentCount;
++        if (b.owner == owner && b.thread == thread && b.target == target && b.camera == camera) match = &b;
++    }
++    if (!match || recentCount != 1) { Cancel(Phase::Rejected, "binding_not_unique_or_recent"); return; }
++    Acquire(lock_);
++    const auto generation = control_.generation + 1;
++    control_ = {};
++    control_.generation = generation;
++    control_.phase = Phase::Active;
++    control_.reason = "camera_hold_active";
++    control_.binding = *match;
++    control_.dx = dx;
++    control_.axis = axis;
++    control_.positionMode = keyboard ? PositionMode::Keyboard : absolute ? PositionMode::Absolute : offset ? PositionMode::Offset : PositionMode::Axis;
++    control_.speed = speed;
++    if (keyboard) {
++        unsigned releaseFirst = 0;
++        for (const auto key : std::array<int, 6> {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_PRIOR, VK_NEXT})
++            if (GetAsyncKeyState(key) & 0x8000) releaseFirst |= KeyBit(key);
++        keyboardReleaseFirst_.store(releaseFirst);
++        keyboardLease_.store(now + frequency_);
++    }
++    if (keyboard && previous.phase == Phase::Active && previous.hasPositionTarget &&
++        previous.binding.owner == match->owner && previous.binding.target == match->target &&
++        previous.binding.camera == match->camera && previous.binding.thread == match->thread && FinitePosition(previous.positionTarget)) {
++        control_.positionTarget = previous.positionTarget;
++        control_.hasPositionTarget = true;
++    }
++    keyboardStop_.store(false);
++    control_.requestedPosition = requestedPosition;
++
++    lock_.clear(std::memory_order_release);
++    nonce_ = nonce;
++}
++
++void NativeArgumentTrial::Poll(std::span<const TrialBinding> bindings, LONGLONG now) {
++    if (keyboardStop_.exchange(false)) Cancel(Phase::Stopped, "keyboard_f8_stop");
++    const auto request = directory_ / "pose_arg_trial_request.txt";
++    std::error_code error;
++    const bool exists = std::filesystem::exists(request, error);
++    if (error) throw std::runtime_error("request_status_failed");
++    if (!exists) {
++        if (hadRequest_) Cancel(Phase::Stopped, "request_removed");
++        hadRequest_ = false;
++        lastCommand_.clear();
++    } else {
++        hadRequest_ = true;
++        const auto size = std::filesystem::file_size(request);
++        if (!size || size > 512) {
++            Cancel(Phase::Rejected, "request_size_invalid");
++            lastCommand_.clear();
++        } else {
++            std::ifstream file(request, std::ios::binary);
++            std::string command(static_cast<std::size_t>(size), '\0');
++            if (!file.read(command.data(), static_cast<std::streamsize>(size))) throw std::runtime_error("request_read_failed");
++            if (command != lastCommand_) { lastCommand_ = command; Command(command, bindings, now); }
++        }
++    }
++    // No focus/timer revocation: background throttling is not camera replacement.
++    // Each actual setter callback validates owner/thread/target before override.
++    Acquire(lock_);
++    const bool capture = control_.phase == Phase::Active && control_.positionMode == PositionMode::Keyboard;
++    lock_.clear(std::memory_order_release);
++    keyboardLease_.store(capture ? now + frequency_ : 0);
++    Save(bindings, now);
++}
++
++NativeArgumentTrial::Ticket NativeArgumentTrial::Prepare(std::uintptr_t owner, void* target, unsigned depth,
++        const std::array<float, 3>& source, std::array<float, 3>& copy) noexcept {
++    if (lock_.test_and_set(std::memory_order_acquire)) return {};
++    auto& c = control_;
++    if (keyboardStop_.load()) { c.phase = Phase::Stopped; c.reason = "keyboard_f8_stop"; }
++    if (c.axis >= 3) { lock_.clear(std::memory_order_release); return {}; }
++    Ticket ticket;
++    if (c.generation && depth == 1 && owner == c.binding.owner && GetCurrentThreadId() == c.binding.thread) {
++        if (reinterpret_cast<std::uintptr_t>(target) != c.binding.target) {
++            c.phase = Phase::Stopped; c.reason = "setter_target_changed";
++        } else {
++            ticket.generation = c.generation;
++            if (c.phase == Phase::Active && c.positionMode == PositionMode::Keyboard) {
++                LARGE_INTEGER tick {}; QueryPerformanceCounter(&tick);
++                if (!keyboardReady_.load() || tick.QuadPart >= keyboardLease_.load()) {
++                    c.phase = Phase::Stopped; c.reason = "keyboard_capture_unavailable";
++                }
++            }
++            if (c.phase == Phase::Active) {
++                if (FinitePosition(source)) {
++                    if (c.positionMode == PositionMode::Axis) {
++                        copy = source; copy[c.axis] += c.dx;
++                        ticket.replaced = FinitePosition(copy);
++                    } else {
++                        if (!c.hasPositionTarget) {
++                            c.positionTarget = c.requestedPosition;
++                            if (c.positionMode == PositionMode::Keyboard) c.positionTarget = source;
++                            if (c.positionMode == PositionMode::Offset)
++                                for (std::size_t i = 0; i < 3; ++i) c.positionTarget[i] += source[i];
++                            c.hasPositionTarget = true;
++                        }
++                        if (c.positionMode == PositionMode::Keyboard) {
++                            LARGE_INTEGER tick {}; QueryPerformanceCounter(&tick);
++                            const double dt = c.movementTick && tick.QuadPart >= c.movementTick
++                                ? (std::min)(0.1, static_cast<double>(tick.QuadPart - c.movementTick) / frequency_) : 0;
++                            c.movementTick = tick.QuadPart;
++                            const bool focused = GameFocused();
++                            if (!focused) keyboardKeys_.store(0);
++                            const unsigned keys = focused && tick.QuadPart < keyboardLease_.load() ? keyboardKeys_.load() : 0;
++                            if (keys && c.hasMovementRotation) {
++                                const float right = static_cast<float>(!!(keys & 0x80)) - static_cast<float>(!!(keys & 0x20));
++                                const float forward = static_cast<float>(!!(keys & 0x02)) - static_cast<float>(!!(keys & 0x08));
++                                const float up = static_cast<float>(!!(keys & 0x100)) - static_cast<float>(!!(keys & 0x200));
++                                const auto& q = c.movementRotation;
++                                // XYZW basis matches the visually tested rotation convention.
++                                const std::array<float, 3> r {1-2*(q[1]*q[1]+q[2]*q[2]), 2*(q[0]*q[1]+q[3]*q[2]), 2*(q[0]*q[2]-q[3]*q[1])};
++                                const std::array<float, 3> f {2*(q[0]*q[2]+q[3]*q[1]), 2*(q[1]*q[2]-q[3]*q[0]), 1-2*(q[0]*q[0]+q[1]*q[1])};
++                                std::array<float, 3> direction {};
++                                float length2 = 0;
++                                for (std::size_t i = 0; i < 3; ++i) {
++                                    direction[i] = right*r[i] + forward*f[i] + (i == 1 ? up : 0);
++                                    length2 += direction[i]*direction[i];
++                                }
++                                if (length2 > 0) {
++                                    const double step = static_cast<double>(c.speed) * dt / std::sqrt(length2);
++                                    for (std::size_t i = 0; i < 3; ++i)
++                                        c.positionTarget[i] = static_cast<float>(c.positionTarget[i] + direction[i] * step);
++                                }
++                            }
++                        }
++                        if (FinitePosition(c.positionTarget)) {
++                            copy = c.positionTarget;
++                            ticket.replaced = true;
++                        } else { c.phase = Phase::Stopped; c.reason = "nonfinite_position_target"; }
++                    }
++                    if (ticket.replaced) {
++                        c.sourcePosition = source; c.appliedPosition = copy;
++                        c.sourceX = source[0]; c.appliedX = copy[0];
++                        c.sourceComponent = source[c.axis]; c.appliedComponent = copy[c.axis];
++                    } else if (c.phase == Phase::Active) { c.phase = Phase::Stopped; c.reason = "nonfinite_pose"; }
++                } else { c.phase = Phase::Stopped; c.reason = "nonfinite_pose"; }
++            }
++        }
++    } else if ((c.phase == Phase::Active || c.phase == Phase::WaitingFocus) && depth == 1) {
++        c.phase = Phase::Stopped; c.reason = "owner_or_thread_changed";
++    }
++    lock_.clear(std::memory_order_release);
++    return ticket;
++}
++
++NativeArgumentTrial::Ticket NativeArgumentTrial::PrepareRotation(std::uintptr_t owner, void* target, unsigned depth,
++        const std::array<float, 4>& source, std::array<float, 4>& copy) noexcept {
++    if (lock_.test_and_set(std::memory_order_acquire)) return {};
++    auto& c = control_;
++    Ticket ticket;
++    if (c.positionMode == PositionMode::Keyboard && c.phase == Phase::Active) {
++        if (depth == 1 && owner == c.binding.owner && GetCurrentThreadId() == c.binding.thread &&
++                reinterpret_cast<std::uintptr_t>(target) == c.binding.target) {
++            float length2 = 0;
++            for (float value : source) length2 += value*value;
++            if (std::isfinite(length2) && length2 >= 0.9f && length2 <= 1.1f) {
++                const float inverse = 1.0f / std::sqrt(length2);
++                for (std::size_t i = 0; i < 4; ++i) c.movementRotation[i] = source[i]*inverse;
++                c.hasMovementRotation = true;
++            } else { c.phase = Phase::Stopped; c.reason = "invalid_movement_rotation"; }
++        } else if (depth == 1) { c.phase = Phase::Stopped; c.reason = "movement_rotation_binding_changed"; }
++        lock_.clear(std::memory_order_release);
++        return {};
++    }
++    if (c.axis < 3) { lock_.clear(std::memory_order_release); return {}; }
++    if (c.generation && depth == 1 && owner == c.binding.owner && GetCurrentThreadId() == c.binding.thread) {
++        if (reinterpret_cast<std::uintptr_t>(target) != c.binding.target) {
++            c.phase = Phase::Stopped; c.reason = "rotation_target_changed";
++        } else {
++            ticket.generation = c.generation;
++            if (c.phase == Phase::Active) {
++                {
++                    float length2 = 0;
++                    for (float component : source) length2 += component * component;
++                    if (!std::isfinite(length2) || length2 < 0.9f || length2 > 1.1f) {
++                        c.phase = Phase::Stopped; c.reason = "rotation_not_unit_quaternion_candidate";
++                    } else {
++                        if (!c.hasRotationAnchor) {
++                            const float inverse = 1.0f / std::sqrt(length2);
++                            for (std::size_t i = 0; i < 4; ++i) c.rotationAnchor[i] = source[i] * inverse;
++                            c.hasRotationAnchor = true;
++                        }
++                        // Explicit XYZW layout hypothesis, to be tested visually.
++                        // Fixed anchor prevents a +5-degree change accumulating every call.
++                        const auto& q = c.rotationAnchor;
++                        const float halfAngle = c.dx * 3.14159265358979323846f / 360.0f;
++                        const float s = std::sin(halfAngle), w = std::cos(halfAngle);
++                        if (c.axis == 3) { // candidate world-Y yaw: delta * anchor
++                            copy = {w*q[0]+s*q[2], w*q[1]+s*q[3], w*q[2]-s*q[0], w*q[3]-s*q[1]};
++                        } else { // candidate local-X pitch: anchor * delta
++                            copy = {w*q[0]+s*q[3], w*q[1]+s*q[2], w*q[2]-s*q[1], w*q[3]-s*q[0]};
++                        }
++                        c.sourceRotation = source; c.appliedRotation = copy;
++                        c.sourceComponent = 0; c.appliedComponent = c.dx;
++                        ticket.replaced = true;
++                    }
++                }
++            }
++        }
++    } else if ((c.phase == Phase::Active || c.phase == Phase::WaitingFocus) && depth == 1) {
++        c.phase = Phase::Stopped; c.reason = "owner_or_thread_changed";
++    }
++    lock_.clear(std::memory_order_release);
++    return ticket;
++}
++
++void NativeArgumentTrial::Returned(Ticket ticket) noexcept {
++    if (!ticket.generation) return;
++    LARGE_INTEGER now {}; QueryPerformanceCounter(&now);
++    if (lock_.test_and_set(std::memory_order_acquire)) return;
++    if (ticket.generation == control_.generation) {
++        if (ticket.replaced) { ++control_.replaced; control_.lastReplaced = now.QuadPart; }
++        else { ++control_.forwarded; control_.lastForwarded = now.QuadPart; }
++    }
++    lock_.clear(std::memory_order_release);
++}
++
++void NativeArgumentTrial::IoFailed() noexcept { Cancel(Phase::Stopped, "ipc_io_failed"); }
++
++void NativeArgumentTrial::Save(std::span<const TrialBinding> bindings, LONGLONG now) {
++    Acquire(lock_); const auto c = control_; lock_.clear(std::memory_order_release);
++    const char* phase = "idle";
++    switch (c.phase) {
++    case Phase::WaitingFocus: phase = "waiting_focus"; break;
++    case Phase::Active: phase = "active"; break;
++    case Phase::Completed: phase = "completed"; break;
++    case Phase::Stopped: phase = "stopped"; break;
++    case Phase::Rejected: phase = "rejected"; break;
++    default: break;
++    }
++    const auto temporary = directory_ / "pose_arg_trial_state.tmp";
++    const auto output = directory_ / "pose_arg_trial_state.json";
++    {
++        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
++        file.exceptions(std::ios::badbit | std::ios::failbit);
++        file.imbue(std::locale::classic()); file << std::setprecision(10);
++        file << "{\"schema_version\":1,\"pid\":" << GetCurrentProcessId() << ",\"start_qpc\":" << session_
++            << ",\"qpc_frequency\":" << frequency_ << ",\"heartbeat_qpc\":" << now
++            << ",\"mode\":\"argument_x_visual_trial\",\"render_camera_verified\":false,\"source_pose_writes\":false"
++            << ",\"supported_axes\":[\"x\",\"y\",\"z\",\"yaw\",\"pitch\"],\"supports_xyz\":true,\"supports_rotation\":true"
++            << ",\"supports_custom_position\":true,\"custom_position_limit\":null,\"supports_persistent_pose\":true"
++            << ",\"supports_keyboard_movement\":true,\"keyboard_hook_ready\":" << (keyboardReady_.load() ? "true" : "false")
++            << ",\"keyboard_speed\":" << c.speed
++            << ",\"phase\":\"" << phase << "\",\"reason\":\"" << c.reason << "\",\"nonce\":\"" << nonce_
++            << "\",\"generation\":" << c.generation << ",\"argument_override_count\":" << c.replaced
++            << ",\"original_argument_count\":" << c.forwarded
++            << ",\"last_override_qpc\":" << c.lastReplaced << ",\"last_original_argument_qpc\":" << c.lastForwarded
++            << ",\"deadline_qpc\":" << c.expires << ",\"source_x\":" << c.sourceX << ",\"applied_x\":" << c.appliedX
++            << ",\"axis\":" << c.axis << ",\"source_component\":" << c.sourceComponent << ",\"applied_component\":" << c.appliedComponent
++            << ",\"argument_kind\":\"" << (c.positionMode == PositionMode::Keyboard ? "keyboard" : c.positionMode != PositionMode::Axis ? "custom_position" : c.axis < 3 ? "position" : "rotation") << "\",\"requested_delta\":" << c.dx
++            << ",\"custom_position_mode\":\"" << (c.positionMode == PositionMode::Absolute ? "absolute" : c.positionMode == PositionMode::Offset ? "offset" : "none") << '"'
++            << ",\"source_position\":[" << c.sourcePosition[0] << ',' << c.sourcePosition[1] << ',' << c.sourcePosition[2]
++            << "],\"applied_position\":[" << c.appliedPosition[0] << ',' << c.appliedPosition[1] << ',' << c.appliedPosition[2] << ']'
++            << ",\"rotation_order_hypothesis\":\"xyzw\",\"rotation_order_verified\":false"
++            << ",\"source_rotation\":[" << c.sourceRotation[0] << ',' << c.sourceRotation[1] << ',' << c.sourceRotation[2] << ',' << c.sourceRotation[3]
++            << "],\"applied_rotation\":[" << c.appliedRotation[0] << ',' << c.appliedRotation[1] << ',' << c.appliedRotation[2] << ',' << c.appliedRotation[3] << ']'
++            << ",\"visual_restore_verified\":false,\"bindings\":[";
++        bool first = true;
++        for (const auto& b : bindings) {
++            if (!Recent(b, now, frequency_)) continue;
++            if (!first) file << ','; first = false;
++            file << "{\"owner\":\"0x" << std::hex << b.owner << "\",\"target\":\"0x" << b.target
++                << "\",\"camera\":\"0x" << b.camera << std::dec << "\",\"thread_id\":" << b.thread
++                << ",\"position\":[" << b.position[0] << ',' << b.position[1] << ',' << b.position[2] << "]}";
++        }
++        file << "]}\n";
++        file.flush();
++        file.close();
++    }
++    // A scanner/reader can briefly hold the destination without DELETE sharing.
++    // Retry only transient Windows sharing/access errors, on the worker thread.
++    // Persistent IPC failures revoke camera control.
++    for (unsigned attempt = 0; ; ++attempt) {
++        if (MoveFileExW(temporary.c_str(), output.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) break;
++        const DWORD error = GetLastError();
++        if (attempt >= 4 || (error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION && error != ERROR_ACCESS_DENIED))
++            throw std::system_error(static_cast<int>(error), std::system_category(), "state_publish_failed");
++        std::this_thread::sleep_for(std::chrono::milliseconds(10u << attempt));
++    }
++}
++}
++#endif
+diff --git a/src/plugin/camera/NativePoseHook.cpp b/src/plugin/camera/NativePoseHook.cpp
+new file mode 100644
+index 0000000..f7800b3
+--- /dev/null
++++ b/src/plugin/camera/NativePoseHook.cpp
+@@ -0,0 +1,610 @@
++#if defined(GCT_NATIVE_POSE_OBSERVER)
++
++#include "plugin/camera/NativePoseHook.hpp"
++#include "plugin/Helper.hpp"
++#include "util/win/Loader.hpp"
++#include "plugin/camera/NativeArgumentTrial.hpp"
++
++#include <Windows.h>
++#include <bcrypt.h>
++
++#include <array>
++#include <algorithm>
++#include <atomic>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <cstddef>
++#include <filesystem>
++#include <fstream>
++#include <iomanip>
++#include <sstream>
++#include <locale>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <system_error>
++
++import mmh;
++
++namespace z3lx::plugin::camera {
++namespace {
++constexpr std::uintptr_t ApplyRva = 0x6cfd1b0;
++// This fork has no verified render-camera binding, callback ordering or pose-frame
++// contract for this binary. A recent owner/thread sample is NOT that evidence.
++// Closed capability, not a setting: implement/verify the binding before replacing
++// this gate. Neither a build option nor a request file may grant write authority.
++constexpr bool HasVerifiedPoseWriteContract = false;
++constexpr char ExpectedHash[] = "08A3086D5F3FE695F01DAB61EFA42E442006B18E5E475B2520DF356F6A073B7D";
++constexpr std::array<unsigned char, 14> EntryBytes {
++    0x56, 0x57, 0x48, 0x83, 0xec, 0x48, 0x48, 0x89, 0xce,
++    0xe8, 0x52, 0x5a, 0x75, 0xfa
++};
++
++void CheckCrypto(NTSTATUS result) {
++    if (result < 0) throw std::runtime_error("hash_failed");
++}
++
++std::string HashFile(const std::filesystem::path& path) {
++    struct Crypto final {
++        BCRYPT_ALG_HANDLE algorithm = nullptr;
++        BCRYPT_HASH_HANDLE hash = nullptr;
++        ~Crypto() {
++            if (hash) BCryptDestroyHash(hash);
++            if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
++        }
++    } crypto;
++    CheckCrypto(BCryptOpenAlgorithmProvider(&crypto.algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0));
++    CheckCrypto(BCryptCreateHash(crypto.algorithm, &crypto.hash, nullptr, 0, nullptr, 0, 0));
++    std::ifstream file(path, std::ios::binary);
++    if (!file) throw std::runtime_error("input_unreadable");
++    std::array<unsigned char, 65536> buffer {};
++    while (file) {
++        file.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
++        const auto count = file.gcount();
++        if (count > 0) CheckCrypto(BCryptHashData(crypto.hash, buffer.data(), static_cast<ULONG>(count), 0));
++    }
++    if (!file.eof() || file.bad()) throw std::runtime_error("input_read_failed");
++    std::array<unsigned char, 32> digest {};
++    CheckCrypto(BCryptFinishHash(crypto.hash, digest.data(), static_cast<ULONG>(digest.size()), 0));
++    constexpr char hex[] = "0123456789ABCDEF";
++    std::string result;
++    result.reserve(64);
++    for (const auto byte : digest) {
++        result += hex[byte >> 4];
++        result += hex[byte & 15];
++    }
++    return result;
++}
++
++// Callback-local data only. No extra engine calls or dereferences of opaque targets.
++struct TargetTrace final {
++    std::uintptr_t owner = 0;
++    std::uintptr_t positionTarget = 0, rotationTarget = 0, cameraTarget = 0;
++    std::array<float, 3> position {};
++    std::array<float, 4> rotation {};
++    unsigned step = 0, positionOrder = 0, rotationOrder = 0, cameraOrder = 0;
++    unsigned positionCalls = 0, rotationCalls = 0, cameraCalls = 0;
++    LONGLONG start = 0, end = 0;
++};
++
++struct Entry final {
++    std::uintptr_t owner = 0;
++    DWORD thread = 0;
++    std::uint64_t count = 0;
++    LONGLONG first = 0;
++    LONGLONG last = 0;
++    unsigned maxDepth = 0;
++    std::uint64_t completedCalls = 0;
++    TargetTrace trace {};
++};
++} // namespace
++
++namespace detail {
++struct PoseObserverState final {
++    mmh::Hook<void, void*> hook;
++    void (*original)(void*) = nullptr;
++    mmh::Hook<void, void*, const void*> positionHook, rotationHook;
++    mmh::Hook<void, void*> cameraFlagsHook;
++    void (*positionOriginal)(void*, const void*) = nullptr;
++    void (*rotationOriginal)(void*, const void*) = nullptr;
++    void (*cameraFlagsOriginal)(void*) = nullptr;
++    std::atomic_flag samplesLock = ATOMIC_FLAG_INIT;
++    std::atomic<std::uint64_t> calls { 0 };
++    std::atomic<std::uint64_t> contentionDrops { 0 };
++    std::uint64_t capacityDrops = 0; // guarded by samplesLock
++    std::array<Entry, 64> entries {};
++    std::ofstream log;
++    LONGLONG frequency = 0;
++    LONGLONG started = 0;
++    LONGLONG lastFlush = 0;
++    std::uint64_t lastCalls = 0;
++    bool observing = false; // worker thread only
++    bool logFailed = false;
++#if defined(GCT_NATIVE_ARGUMENT_TRIAL)
++    NativeArgumentTrial argumentTrial;
++    LONGLONG lastTrialPoll = 0;
++    LONGLONG lastTrialIoLog = 0;
++    std::uint64_t trialIoFailures = 0;
++#endif
++#if defined(GCT_NATIVE_POSE_EXPERIMENT)
++    // This does NOT establish a camera identity: explicit session-scoped
++    // selection, short-lived opt-in, and an isolated build are required.
++    struct Request {
++        std::uintptr_t owner = 0;
++        DWORD thread = 0;
++        float dx = 0;
++        LONGLONG expiresQpc = 0;
++    } request;
++    std::atomic_flag requestLock = ATOMIC_FLAG_INIT;
++    std::atomic_flag mutationLock = ATOMIC_FLAG_INIT;
++    std::filesystem::file_time_type requestFileTime {};
++    bool sawRequestFile = false;
++    std::atomic<std::uint64_t> applyCount { 0 };
++#endif
++};
++} // namespace detail
++
++namespace {
++std::atomic<detail::PoseObserverState*> observer { nullptr };
++thread_local unsigned callbackDepth = 0;
++thread_local TargetTrace* currentTrace = nullptr;
++
++void ObservePosition(void* target, const void* value) {
++    const DWORD lastError = GetLastError();
++    auto* state = observer.load(std::memory_order_acquire);
++    if (currentTrace) {
++        currentTrace->positionTarget = reinterpret_cast<std::uintptr_t>(target);
++        currentTrace->positionOrder = ++currentTrace->step;
++        ++currentTrace->positionCalls;
++        if (value) std::memcpy(currentTrace->position.data(), value, sizeof(float) * 3);
++    }
++#if defined(GCT_NATIVE_ARGUMENT_TRIAL)
++    NativeArgumentTrial::Ticket ticket;
++    std::array<float, 3> argumentCopy {};
++    if (currentTrace && value) {
++        ticket = state->argumentTrial.Prepare(currentTrace->owner, target, callbackDepth, currentTrace->position, argumentCopy);
++    }
++    SetLastError(lastError);
++    // The original setter consumes this call-local copy synchronously. Never
++    // patch owner+0x64, the source argument, or a retained game-object pointer.
++    state->positionOriginal(target, ticket.replaced ? argumentCopy.data() : value);
++    const DWORD originalLastError = GetLastError();
++    state->argumentTrial.Returned(ticket);
++    SetLastError(originalLastError);
++#else
++    SetLastError(lastError);
++    state->positionOriginal(target, value);
++#endif
++}
++
++void ObserveRotation(void* target, const void* value) {
++    const DWORD lastError = GetLastError();
++    auto* state = observer.load(std::memory_order_acquire);
++    if (currentTrace) {
++        currentTrace->rotationTarget = reinterpret_cast<std::uintptr_t>(target);
++        currentTrace->rotationOrder = ++currentTrace->step;
++        ++currentTrace->rotationCalls;
++        if (value) std::memcpy(currentTrace->rotation.data(), value, sizeof(float) * 4);
++    }
++#if defined(GCT_NATIVE_ARGUMENT_TRIAL)
++    NativeArgumentTrial::Ticket ticket;
++    std::array<float, 4> argumentCopy {};
++    if (currentTrace && value) {
++        ticket = state->argumentTrial.PrepareRotation(currentTrace->owner, target, callbackDepth, currentTrace->rotation, argumentCopy);
++    }
++    SetLastError(lastError);
++    state->rotationOriginal(target, ticket.replaced ? argumentCopy.data() : value);
++    const DWORD originalLastError = GetLastError();
++    state->argumentTrial.Returned(ticket);
++    SetLastError(originalLastError);
++#else
++    SetLastError(lastError);
++    state->rotationOriginal(target, value);
++#endif
++}
++
++void ObserveCameraFlags(void* target) {
++    auto* state = observer.load(std::memory_order_acquire);
++    if (currentTrace) {
++        currentTrace->cameraTarget = reinterpret_cast<std::uintptr_t>(target);
++        currentTrace->cameraOrder = ++currentTrace->step;
++        ++currentTrace->cameraCalls;
++    }
++    state->cameraFlagsOriginal(target);
++}
++
++void RecordCompletion(detail::PoseObserverState& state, void* owner, const TargetTrace& trace) noexcept {
++    const DWORD lastError = GetLastError();
++    const DWORD thread = GetCurrentThreadId();
++    if (!state.samplesLock.test_and_set(std::memory_order_acquire)) {
++        for (auto& entry : state.entries) {
++            if (entry.count && entry.owner == reinterpret_cast<std::uintptr_t>(owner) && entry.thread == thread) {
++                ++entry.completedCalls;
++                entry.trace = trace;
++                break;
++            }
++        }
++        state.samplesLock.clear(std::memory_order_release);
++    } else state.contentionDrops.fetch_add(1, std::memory_order_relaxed);
++    SetLastError(lastError);
++}
++
++void Record(detail::PoseObserverState& state, void* owner, unsigned depth) noexcept {
++    state.calls.fetch_add(1, std::memory_order_relaxed);
++    // Never block a game thread for diagnostics. Drops remain visible in the log.
++    if (state.samplesLock.test_and_set(std::memory_order_acquire)) {
++        state.contentionDrops.fetch_add(1, std::memory_order_relaxed);
++        return;
++    }
++    LARGE_INTEGER now {};
++    QueryPerformanceCounter(&now);
++    const auto thread = GetCurrentThreadId();
++    const auto pointer = reinterpret_cast<std::uintptr_t>(owner);
++    bool recorded = false;
++    for (auto& entry : state.entries) {
++        if (entry.count == 0 || (entry.owner == pointer && entry.thread == thread)) {
++            if (entry.count == 0) {
++                entry.owner = pointer;
++                entry.thread = thread;
++                entry.first = now.QuadPart;
++            }
++            ++entry.count;
++            entry.last = now.QuadPart;
++            if (depth > entry.maxDepth) entry.maxDepth = depth;
++            recorded = true;
++            break;
++        }
++    }
++    if (!recorded) ++state.capacityDrops;
++    state.samplesLock.clear(std::memory_order_release);
++}
++
++#if defined(GCT_NATIVE_POSE_EXPERIMENT)
++// Deliberately NOT a FreeCam implementation. This is a five-second, one-axis,
++// single-owner native *write* experiment, currently blocked by the contract gate.
++// The dormant scope restores the source float on ordinary return/C++ unwind;
++// that is not a verified lifecycle/SEH/concurrent-writer or visual-restore contract.
++// Requests are supplied from the worker (never read files in a game callback).
++struct ScopedPoseExperiment final {
++    detail::PoseObserverState& state;
++    std::byte* field = nullptr;
++    float oldX = 0;
++    bool locked = false;
++    bool patched = false;
++
++    ScopedPoseExperiment(detail::PoseObserverState& s, void* owner, unsigned depth) noexcept : state(s) {
++        // Must precede all owner dereferences and temporary writes, independently
++        // of the worker's request validation. No native write is reachable today.
++        if (!HasVerifiedPoseWriteContract) return;
++        if (!owner || depth != 1 || state.mutationLock.test_and_set(std::memory_order_acquire)) return;
++        locked = true;
++        if (state.requestLock.test_and_set(std::memory_order_acquire)) return;
++        auto request = state.request;
++        state.requestLock.clear(std::memory_order_release);
++        if (request.owner != reinterpret_cast<std::uintptr_t>(owner) ||
++            request.thread != GetCurrentThreadId() || request.dx == 0.0f) return;
++        LARGE_INTEGER now {};
++        if (!QueryPerformanceCounter(&now) || now.QuadPart >= request.expiresQpc) return;
++        // Offset is only supported by the static trace pinned to ExpectedHash;
++        // this pointer is never inferred from the FOV instance.
++        field = reinterpret_cast<std::byte*>(owner) + 0x64;
++        std::memcpy(&oldX, field, sizeof(oldX));
++        const float newX = oldX + request.dx;
++        if (!std::isfinite(oldX) || !std::isfinite(newX)) { field = nullptr; return; }
++        std::memcpy(field, &newX, sizeof(newX));
++        patched = true;
++        state.applyCount.fetch_add(1, std::memory_order_relaxed);
++    }
++    ~ScopedPoseExperiment() noexcept {
++        if (patched) std::memcpy(field, &oldX, sizeof(oldX));
++        if (locked) state.mutationLock.clear(std::memory_order_release);
++    }
++    ScopedPoseExperiment(const ScopedPoseExperiment&) = delete;
++    ScopedPoseExperiment& operator=(const ScopedPoseExperiment&) = delete;
++};
++
++// Text request deliberately requires a PID, QPC session start, exact owner and
++// thread from THIS process's observer log. Format:
++// GCTPOSE1 <pid> <start_qpc> <owner_hex> <thread_id> <x_delta>
++// e.g. GCTPOSE1 1234 987654321 0x12340000 5678 0.25
++// A new file modification grants at most a five-second window, never persistent.
++void ReadPoseExperiment(detail::PoseObserverState& s, LONGLONG now) {
++    const auto path = util::GetCurrentModuleFilePath().parent_path() / "pose_experiment_request.txt";
++    std::error_code error;
++    const auto time = std::filesystem::last_write_time(path, error);
++    if (error) {
++        s.sawRequestFile = false;
++        // Removing the opt-in request stops any pending experiment promptly.
++        while (s.requestLock.test_and_set(std::memory_order_acquire)) std::this_thread::yield();
++        s.request = {};
++        s.requestLock.clear(std::memory_order_release);
++        return;
++    }
++    if (s.sawRequestFile && time == s.requestFileTime) return;
++    s.sawRequestFile = true;
++    s.requestFileTime = time;
++    // A malformed edit MUST revoke the previous request, not leave it active.
++    while (s.requestLock.test_and_set(std::memory_order_acquire)) std::this_thread::yield();
++    s.request = {};
++    s.requestLock.clear(std::memory_order_release);
++    if (!HasVerifiedPoseWriteContract) {
++        s.log << "{\"event\":\"experiment_rejected\",\"reason\":\"camera_identity_unverified\","
++            "\"callback_order_verified\":false,\"pose_frame_verified\":false}\n";
++        return;
++    }
++    std::ifstream in(path);
++    std::string magic, ownerText, extra;
++    unsigned long long start = 0;
++    unsigned long long pid = 0, thread = 0;
++    float dx = 0;
++    if (!(in >> magic >> pid >> start >> ownerText >> thread >> dx) ||
++        (in >> extra) || magic != "GCTPOSE1" ||
++        pid != GetCurrentProcessId() ||
++        start != static_cast<unsigned long long>(s.started) ||
++        thread == 0 || thread > 0xFFFFFFFFull ||
++        !std::isfinite(dx) || dx < -0.5f || dx > 0.5f || dx == 0.0f) {
++        s.log << "{\"event\":\"experiment_rejected\",\"reason\":\"invalid_request_or_session\"}\n";
++        return;
++    }
++    std::size_t parsed = 0;
++    std::uintptr_t owner = 0;
++    try { owner = static_cast<std::uintptr_t>(std::stoull(ownerText, &parsed, 16)); }
++    catch (...) { parsed = 0; }
++    if (!owner || parsed != ownerText.size() || ownerText.rfind("0x", 0) != 0) {
++        s.log << "{\"event\":\"experiment_rejected\",\"reason\":\"owner_parse\"}\n";
++        return;
++    }
++    // Require the candidate to have been observed recently by this detour.
++    bool observed = false;
++    while (s.samplesLock.test_and_set(std::memory_order_acquire)) std::this_thread::yield();
++    for (const auto& entry : s.entries) {
++        if (entry.owner == owner && entry.thread == thread && entry.count >= 5 &&
++            entry.last <= now && now - entry.last < s.frequency * 2) observed = true;
++    }
++    s.samplesLock.clear(std::memory_order_release);
++    if (!observed) {
++        s.log << "{\"event\":\"experiment_rejected\",\"reason\":\"owner_not_recently_observed\"}\n";
++        return;
++    }
++    while (s.requestLock.test_and_set(std::memory_order_acquire)) std::this_thread::yield();
++    s.request = {owner, static_cast<DWORD>(thread), dx, now + s.frequency * 5};
++    s.requestLock.clear(std::memory_order_release);
++    s.log << "{\"event\":\"experiment_armed\",\"duration_seconds\":5,\"render_camera_verified\":false,\"owner\":\"0x"
++        << std::hex << owner << std::dec << "\",\"thread_id\":" << thread << ",\"x_delta\":" << dx << "}\n";
++}
++#endif
++
++// The void(owner) signature is constrained by static x64 register flow, not live proof.
++// Exactly one original call, outside diagnostic locks; no catch/retry of original.
++void ObserveApplyPose(void* owner) {
++    const DWORD lastError = GetLastError();
++    auto* state = observer.load(std::memory_order_acquire);
++    struct Depth final {
++        Depth() { ++callbackDepth; }
++        ~Depth() { --callbackDepth; }
++    } depth;
++    TargetTrace trace;
++    trace.owner = reinterpret_cast<std::uintptr_t>(owner);
++    struct TraceScope final {
++        TargetTrace* previous;
++        explicit TraceScope(TargetTrace& value) : previous(currentTrace) { currentTrace = &value; }
++        ~TraceScope() { currentTrace = previous; }
++    } traceScope(trace);
++    LARGE_INTEGER start {};
++    QueryPerformanceCounter(&start);
++    trace.start = start.QuadPart;
++    Record(*state, owner, callbackDepth);
++#if defined(GCT_NATIVE_POSE_EXPERIMENT)
++    ScopedPoseExperiment experiment(*state, owner, callbackDepth);
++#endif
++    // Preserve caller's last-error state even when experimental checks called Win32.
++    SetLastError(lastError);
++    state->original(owner);
++    const DWORD originalLastError = GetLastError();
++    LARGE_INTEGER end {};
++    QueryPerformanceCounter(&end);
++    trace.end = end.QuadPart;
++    RecordCompletion(*state, owner, trace);
++    SetLastError(originalLastError);
++}
++
++void Flush(detail::PoseObserverState& state, LONGLONG now) {
++    std::array<Entry, 64> entries;
++    std::uint64_t capacityDrops;
++    // Only the plugin worker waits. Copy then release before formatting/file I/O.
++    while (state.samplesLock.test_and_set(std::memory_order_acquire)) std::this_thread::yield();
++    entries = state.entries;
++    capacityDrops = state.capacityDrops;
++    state.samplesLock.clear(std::memory_order_release);
++    const auto total = state.calls.load(std::memory_order_relaxed);
++    const double seconds = static_cast<double>(now - state.lastFlush) / state.frequency;
++#if defined(GCT_NATIVE_POSE_EXPERIMENT)
++    ReadPoseExperiment(state, now);
++#endif
++    state.log << "{\"event\":\"samples\",\"qpc\":" << now
++        << ",\"calls\":" << total << ",\"window_seconds\":" << seconds
++        << ",\"calls_per_second\":" << static_cast<double>(total - state.lastCalls) / seconds
++        << ",\"contention_drops\":" << state.contentionDrops.load(std::memory_order_relaxed)
++        << ",\"capacity_drops\":" << capacityDrops
++#if defined(GCT_NATIVE_POSE_EXPERIMENT)
++        << ",\"experiment_apply_count\":" << state.applyCount.load(std::memory_order_relaxed)
++#endif
++        << ",\"owners\":[";
++    bool first = true;
++    for (const auto& entry : entries) {
++        if (entry.count == 0) continue;
++        if (!first) state.log << ',';
++        first = false;
++        state.log << "{\"owner\":\"0x" << std::hex << entry.owner << std::dec
++            << "\",\"thread_id\":" << entry.thread << ",\"recorded_calls\":" << entry.count
++            << ",\"first_qpc\":" << entry.first << ",\"last_qpc\":" << entry.last
++            << ",\"max_depth\":" << entry.maxDepth
++            << ",\"completed_calls\":" << entry.completedCalls;
++        const auto& t = entry.trace;
++        state.log << ",\"last_completed_apply\":{\"start_qpc\":" << t.start << ",\"end_qpc\":" << t.end
++            << ",\"position_target\":\"0x" << std::hex << t.positionTarget
++            << "\",\"rotation_target\":\"0x" << t.rotationTarget
++            << "\",\"camera_flags_target\":\"0x" << t.cameraTarget << std::dec
++            << "\",\"position_calls\":" << t.positionCalls << ",\"rotation_calls\":" << t.rotationCalls
++            << ",\"camera_flags_calls\":" << t.cameraCalls
++            << ",\"position_order\":" << t.positionOrder << ",\"rotation_order\":" << t.rotationOrder
++            << ",\"camera_flags_order\":" << t.cameraOrder;
++        const bool finite = std::isfinite(t.position[0]) && std::isfinite(t.position[1]) && std::isfinite(t.position[2])
++            && std::isfinite(t.rotation[0]) && std::isfinite(t.rotation[1]) && std::isfinite(t.rotation[2]) && std::isfinite(t.rotation[3]);
++        state.log << ",\"values_finite\":" << (finite ? "true" : "false");
++        if (finite) state.log << ",\"position_candidate\":[" << t.position[0] << ',' << t.position[1] << ',' << t.position[2]
++            << "],\"rotation_candidate\":[" << t.rotation[0] << ',' << t.rotation[1] << ',' << t.rotation[2] << ',' << t.rotation[3] << ']';
++        state.log << "}}";
++    }
++    state.log << "]}\n";
++    state.log.flush();
++    state.lastCalls = total;
++    state.lastFlush = now;
++}
++} // namespace
++
++void NativePoseHook::Start() noexcept {
++    if (state_) return;
++    try {
++        // Intentionally retained until process exit, including failed-start state.
++        // Never free an enabled trampoline while game callbacks could be in flight.
++        state_ = new detail::PoseObserverState;
++        state_->log.exceptions(std::ios::badbit | std::ios::failbit);
++        state_->log.open(util::GetCurrentModuleFilePath().parent_path() / "pose_observer.jsonl", std::ios::app);
++        state_->log.imbue(std::locale::classic());
++        state_->log << std::setprecision(10);
++        const auto [module, region] = GetGameModuleContext();
++        if (region != GameRegion::OS) throw std::runtime_error("unsupported_region");
++        std::wstring path(32768, L'\0');
++        const DWORD size = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
++        if (!size || size >= path.size()) throw std::runtime_error("module_path_failed");
++        path.resize(size);
++        if (HashFile(path) != ExpectedHash) throw std::runtime_error("binary_hash_mismatch");
++        auto* target = reinterpret_cast<unsigned char*>(module) + ApplyRva;
++        if (std::memcmp(target, EntryBytes.data(), EntryBytes.size()) != 0)
++            throw std::runtime_error("entry_bytes_mismatch");
++        constexpr std::array<unsigned char, 14> setterBytes {
++            0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xfa, 0x48
++        };
++        constexpr std::array<unsigned char, 14> flagsBytes {
++            0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0x48, 0x85, 0xc9, 0x74, 0x17
++        };
++        auto* base = reinterpret_cast<unsigned char*>(module);
++        if (std::memcmp(base + 0x1435d50, setterBytes.data(), setterBytes.size()) != 0 ||
++            std::memcmp(base + 0x1436190, setterBytes.data(), setterBytes.size()) != 0 ||
++            std::memcmp(base + 0x1456b30, flagsBytes.data(), flagsBytes.size()) != 0)
++            throw std::runtime_error("target_trace_entry_mismatch");
++        LARGE_INTEGER frequency {}, now {};
++        if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0 || !QueryPerformanceCounter(&now))
++            throw std::runtime_error("clock_unavailable");
++        state_->frequency = frequency.QuadPart;
++        state_->started = state_->lastFlush = now.QuadPart;
++#if defined(GCT_NATIVE_ARGUMENT_TRIAL)
++        state_->argumentTrial.Initialize(util::GetCurrentModuleFilePath().parent_path(), now.QuadPart, frequency.QuadPart);
++#endif
++        state_->hook = mmh::Hook<void, void*>::Create(target, reinterpret_cast<void*>(ObserveApplyPose));
++        state_->original = reinterpret_cast<void (*)(void*)>(state_->hook.GetOriginal());
++        if (!state_->original) throw std::runtime_error("trampoline_missing");
++        state_->positionHook = mmh::Hook<void, void*, const void*>::Create(base + 0x1435d50, reinterpret_cast<void*>(ObservePosition));
++        state_->rotationHook = mmh::Hook<void, void*, const void*>::Create(base + 0x1436190, reinterpret_cast<void*>(ObserveRotation));
++        state_->cameraFlagsHook = mmh::Hook<void, void*>::Create(base + 0x1456b30, reinterpret_cast<void*>(ObserveCameraFlags));
++        state_->positionOriginal = reinterpret_cast<void (*)(void*, const void*)>(state_->positionHook.GetOriginal());
++        state_->rotationOriginal = reinterpret_cast<void (*)(void*, const void*)>(state_->rotationHook.GetOriginal());
++        state_->cameraFlagsOriginal = reinterpret_cast<void (*)(void*)>(state_->cameraFlagsHook.GetOriginal());
++        if (!state_->positionOriginal || !state_->rotationOriginal || !state_->cameraFlagsOriginal)
++            throw std::runtime_error("target_trace_trampoline_missing");
++        HMODULE pinned = nullptr;
++        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
++                reinterpret_cast<LPCWSTR>(ObserveApplyPose), &pinned)) throw std::runtime_error("module_pin_failed");
++        state_->log << "{\"event\":\"validated\",\"mode\":\""
++#if defined(GCT_NATIVE_POSE_EXPERIMENT)
++            << "experiment_blocked"
++#else
++            << "observe_only"
++#endif
++            << "\",\"trace_schema\":2,\"target_trace\":true,\"pid\":" << GetCurrentProcessId()
++            << ",\"worker_thread_id\":" << GetCurrentThreadId() << ",\"rva\":\"0x6CFD1B0\",\"sha256\":\"" << ExpectedHash
++            << "\",\"qpc_frequency\":" << state_->frequency << ",\"start_qpc\":" << state_->started
++            << ",\"camera_identity_verified\":false,\"pose_write_contract_verified\":"
++            << (HasVerifiedPoseWriteContract ? "true" : "false")
++            << ",\"pose_writes\":false,\"hot_unload_supported\":false}\n";
++#if defined(GCT_NATIVE_ARGUMENT_TRIAL)
++        state_->log << "{\"event\":\"persistent_pose_available\",\"requires_explicit_session_request\":true,"
++            "\"keyboard_movement\":true,\"duration_seconds\":null,\"source_pose_writes\":false,\"render_camera_verified\":false}\n";
++#endif
++        state_->log.flush();
++        observer.store(state_, std::memory_order_release);
++        state_->positionHook.Enable(true);
++        state_->rotationHook.Enable(true);
++        state_->cameraFlagsHook.Enable(true);
++        state_->hook.Enable(true);
++        state_->observing = true;
++        state_->log << "{\"event\":\"hook_enabled\",\"runtime_abi_verified\":false}\n";
++        state_->log.flush();
++    } catch (const std::exception& error) {
++        // Diagnostic setup must not abort the existing FOV/FPS components.
++        // Do not expose arbitrary exception text as JSON (it may contain quotes).
++        OutputDebugStringA("GCT pose observer setup failed; live status remains unverified.\n");
++        try {
++            if (state_ && state_->log.is_open()) {
++                // Reasons from our guards are fixed tokens; library exceptions are generic.
++                const std::string reason = error.what();
++                const bool token = !reason.empty() && reason.find_first_not_of("abcdefghijklmnopqrstuvwxyz_") == std::string::npos;
++                state_->log << "{\"event\":\"setup_failed\",\"reason\":\"" << (token ? reason : "setup_exception") << "\"}\n";
++                state_->log.flush();
++            }
++        } catch (...) { if (state_) state_->logFailed = true; }
++    } catch (...) {
++        OutputDebugStringA("GCT pose observer setup failed with unknown exception.\n");
++    }
++}
++
++void NativePoseHook::Update() noexcept {
++    if (!state_ || !state_->observing || state_->logFailed) return;
++    LARGE_INTEGER now {};
++    if (!QueryPerformanceCounter(&now)) return;
++#if defined(GCT_NATIVE_ARGUMENT_TRIAL)
++    if (now.QuadPart - state_->lastTrialPoll >= state_->frequency / 10) {
++        const auto ioFailed = [&](int code) noexcept {
++            state_->argumentTrial.IoFailed();
++            ++state_->trialIoFailures;
++            if (!state_->lastTrialIoLog || now.QuadPart - state_->lastTrialIoLog >= state_->frequency) {
++                try {
++                    state_->log << "{\"event\":\"argument_trial_io_failed\",\"error_code\":" << code
++                        << ",\"failures\":" << state_->trialIoFailures << ",\"qpc\":" << now.QuadPart << "}\n";
++                    state_->log.flush();
++                } catch (...) { }
++                state_->lastTrialIoLog = now.QuadPart;
++            }
++            state_->lastTrialPoll = now.QuadPart;
++        };
++        try {
++            std::array<TrialBinding, 64> bindings {};
++            while (state_->samplesLock.test_and_set(std::memory_order_acquire)) std::this_thread::yield();
++            for (std::size_t i = 0; i < state_->entries.size(); ++i) {
++                const auto& entry = state_->entries[i];
++                const auto& t = entry.trace;
++                const bool valid = entry.completedCalls >= 5 && entry.maxDepth == 1 &&
++                    std::all_of(t.position.begin(), t.position.end(), [](float v) { return std::isfinite(v); }) && t.positionTarget &&
++                    t.positionTarget == t.rotationTarget && t.cameraTarget && t.positionCalls == 1 &&
++                    t.rotationCalls == 1 && t.cameraCalls == 1 && t.positionOrder == 1 && t.rotationOrder == 2 && t.cameraOrder == 3;
++                bindings[i] = {entry.owner, t.positionTarget, t.cameraTarget, entry.thread, t.end, valid, t.position};
++            }
++            state_->samplesLock.clear(std::memory_order_release);
++            state_->argumentTrial.Poll(bindings, now.QuadPart);
++            state_->lastTrialPoll = now.QuadPart;
++        } catch (const std::system_error& error) { ioFailed(error.code().value()); }
++        catch (...) { ioFailed(static_cast<int>(GetLastError())); }
++    }
++#endif
++    if (now.QuadPart - state_->lastFlush < state_->frequency) return;
++    try { Flush(*state_, now.QuadPart); }
++    catch (...) {
++        state_->logFailed = true;
++        OutputDebugStringA("GCT pose observer log failed; original forwarding remains active.\n");
++    }
++}
++} // namespace z3lx::plugin::camera
++
++#endif // GCT_NATIVE_POSE_OBSERVER
+diff --git a/tests/freecam_core_tests.cpp b/tests/freecam_core_tests.cpp
+new file mode 100644
+index 0000000..07d5f28
+--- /dev/null
++++ b/tests/freecam_core_tests.cpp
+@@ -0,0 +1,161 @@
++#include "plugin/camera/FreeCamCore.hpp"
++
++#include <cmath>
++#include <cstdio>
++#include <thread>
++
++using namespace z3lx::plugin::camera;
++
++#define CHECK(x) do { if (!(x)) { \
++    std::fprintf(stderr, "FAIL %s at line %d\n", #x, __LINE__); return false; \
++} } while (0)
++
++bool Near(float a, float b, float eps = 1e-3f) { return std::fabs(a-b) < eps; }
++
++struct FakeCamera final : IFrameCamera {
++    CameraPose gameplay {};
++    CameraPose rendered {};
++    bool renderThread = true;
++    bool canBegin = true;
++    bool canApply = true;
++    bool canRestore = true;
++    bool detached = false;
++    int beginCalls = 0;
++    int applyCalls = 0;
++    int restoreCalls = 0;
++
++    bool IsOnRenderThread() const noexcept override { return renderThread; }
++    bool Begin(CameraPose& out) noexcept override {
++        ++beginCalls;
++        if (!canBegin) return false;
++        detached = true;
++        rendered = gameplay;
++        out = rendered;
++        return true;
++    }
++    bool Apply(const CameraPose& next) noexcept override {
++        ++applyCalls;
++        if (!detached || !canApply) return false;
++        rendered = next;
++        return true;
++    }
++    bool Restore() noexcept override {
++        ++restoreCalls;
++        if (!canRestore) return false;
++        rendered = gameplay;
++        detached = false;
++        return true;
++    }
++};
++
++bool TestStartMoveStop() {
++    FakeCamera camera;
++    camera.gameplay.position = {10.f, 20.f, 30.f};
++    FreeCamCore core(Settings {6.f, 90.f, 4.f, 0.25f});
++    CHECK(core.Start(camera) == Result::Ok);
++    CHECK(core.Start(camera) == Result::AlreadyEnabled);
++    CHECK(core.Tick(Input {.forward = 1.f}, 0.25f) == Result::Ok);
++    CHECK(Near(camera.rendered.position.z, 31.5f));
++    CHECK(Near(camera.rendered.position.x, 10.f));
++    CHECK(core.ResetPose() == Result::Ok);
++    CHECK(Near(camera.rendered.position.z, 30.f));
++    CHECK(core.Stop() == Result::Ok);
++    CHECK(!core.Active() && !camera.detached);
++    CHECK(Near(camera.rendered.position.z, 30.f));
++    CHECK(camera.restoreCalls == 1);
++    return true;
++}
++
++bool TestYawMove() {
++    FakeCamera camera;
++    FreeCamCore core(Settings {4.f, 360.f, 4.f, 0.25f});
++    CHECK(core.Start(camera) == Result::Ok);
++    CHECK(core.Tick(Input {.forward=1.f, .yaw=1.f}, 0.25f) == Result::Ok);
++    CHECK(Near(camera.rendered.position.x, 1.f));
++    CHECK(Near(camera.rendered.position.z, 0.f));
++    CHECK(core.Stop() == Result::Ok);
++    return true;
++}
++
++bool TestNormalizeMovement() {
++    FakeCamera camera;
++    FreeCamCore core(Settings {4.f, 90.f, 4.f, 0.25f});
++    CHECK(core.Start(camera) == Result::Ok);
++    CHECK(core.Tick(Input {.right = 1.f, .forward = 1.f}, 0.25f) == Result::Ok);
++    const auto p = camera.rendered.position;
++    CHECK(Near(std::sqrt(p.x*p.x + p.z*p.z), 1.f));
++    CHECK(core.Stop() == Result::Ok);
++    return true;
++}
++
++bool TestErrorHandling() {
++    FakeCamera camera;
++    FreeCamCore core;
++    CHECK(core.Tick({}, .1f) == Result::NotEnabled);
++    camera.renderThread = false;
++    CHECK(core.Start(camera) == Result::WrongThread);
++    camera.renderThread = true;
++    camera.canBegin = false;
++    CHECK(core.Start(camera) == Result::BackendUnavailable);
++    camera.canBegin = true;
++    CHECK(core.Start(camera) == Result::Ok);
++    int before = camera.applyCalls;
++    CHECK(core.Tick({}, 0.0f) == Result::InvalidInput);
++    CHECK(core.Tick({}, 1.0f) == Result::InvalidInput);
++    CHECK(camera.applyCalls == before);
++    camera.canApply = false;
++    CHECK(core.Tick({}, .1f) == Result::ApplyFailed);
++    CHECK(!core.Active() && !camera.detached);
++    return true;
++}
++
++bool TestFailedRestoreRetry() {
++    FakeCamera camera;
++    FreeCamCore core;
++    CHECK(core.Start(camera) == Result::Ok);
++    camera.canRestore = false;
++    CHECK(core.Stop() == Result::RestoreFailed);
++    CHECK(core.Active());
++    CHECK(core.Tick({}, .1f) == Result::RestoreFailed);
++    camera.canRestore = true;
++    CHECK(core.Stop() == Result::Ok);
++    CHECK(!core.Active() && !camera.detached);
++    return true;
++}
++
++bool TestInvalidInitialPose() {
++    FakeCamera camera;
++    camera.gameplay.rotation = {0,0,0,0};
++    FreeCamCore core;
++    CHECK(core.Start(camera) == Result::InvalidPose);
++    CHECK(!core.Active() && !camera.detached);
++    CHECK(camera.restoreCalls == 1);
++    return true;
++}
++
++bool TestThreadEnforcement() {
++    FakeCamera camera;
++    FreeCamCore core;
++    CHECK(core.Start(camera) == Result::Ok);
++    Result tick = Result::Ok;
++    Result stop = Result::Ok;
++    std::thread t([&] {
++        tick = core.Tick(Input{.forward=1.f}, 0.1f);
++        stop = core.Stop();
++    });
++    t.join();
++    CHECK(tick == Result::WrongThread);
++    CHECK(stop == Result::WrongThread);
++    CHECK(camera.applyCalls == 0);
++    CHECK(core.Stop() == Result::Ok);
++    return true;
++}
++
++int main() {
++    const bool ok = TestStartMoveStop() && TestYawMove() &&
++        TestNormalizeMovement() && TestErrorHandling() &&
++        TestFailedRestoreRetry() && TestInvalidInitialPose() &&
++        TestThreadEnforcement();
++    if (!ok) return 1;
++    std::puts("FreeCam core tests: 7/7 PASS (FAKE camera only; NO Genshin live claim)");
++}
