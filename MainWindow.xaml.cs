@@ -19,6 +19,7 @@ public partial class MainWindow : Window
     private (int Pid, long Session, string Nonce)? keyboardRequest;
     private bool keyboardAutoAttempted;
     private bool keyboardEventsReady, syncingKeyboardCheckbox;
+    private bool resettingCamera;
     private readonly DispatcherTimer debounce = new() { Interval = TimeSpan.FromMilliseconds(120) };
     private bool ready, closing;
     private long revision, appliedRevision;
@@ -131,6 +132,28 @@ public partial class MainWindow : Window
             await RefreshArgumentTrial();
             return;
         }
+        await StopKeyboard();
+    }
+
+    private async void CameraResetClick(object sender, RoutedEventArgs e)
+    {
+        if (argumentClosing || resettingCamera) return;
+        resettingCamera = true;
+        CameraReset.IsEnabled = false;
+        SetKeyboardChecked(false);
+        keyboardAutoAttempted = true;
+        try
+        {
+            if (argumentCommand != null) { try { await argumentCommand; } catch { } }
+            await StopKeyboard();
+        }
+        finally { resettingCamera = false; CameraReset.IsEnabled = !argumentClosing; }
+    }
+
+    private async Task StopKeyboard()
+    {
+        if (argumentClosing || argumentCommand != null) return;
+        cameraError = null;
         KeyboardStart.IsEnabled = false;
         try
         {

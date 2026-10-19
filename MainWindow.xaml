@@ -43,13 +43,15 @@
         <StackPanel Grid.Row="4" Margin="0,0,0,14">
             <StackPanel Orientation="Horizontal">
                 <CheckBox x:Name="KeyboardStart" Content="Điều khiển camera bằng phím" IsChecked="True"
-                          Checked="KeyboardToggleChanged" Unchecked="KeyboardToggleChanged" VerticalAlignment="Center"/>
+                          Checked="KeyboardToggleChanged" Unchecked="KeyboardToggleChanged" VerticalAlignment="Center" Foreground="#F3F5FA"/>
                 <TextBlock Text="Tốc độ" VerticalAlignment="Center" Margin="10,0,6,0"/>
                 <TextBox x:Name="KeyboardSpeed" Text="3" Width="60" Padding="5,3"/>
             </StackPanel>
             <TextBlock Text="↑↓←→ di chuyển · PgUp lên / PgDn xuống · F8 tắt" Foreground="#BCC5D7" FontSize="12" Margin="0,6,0,0" TextWrapping="Wrap"/>
         </StackPanel>
         <StackPanel Grid.Row="5" Margin="0,0,0,14">
+            <Button x:Name="CameraReset" Content="Tắt / Reset camera" Click="CameraResetClick"
+                    HorizontalAlignment="Left" Padding="12,5"/>
             <TextBlock x:Name="ArgTrialStatus" Foreground="#BCC5D7" FontSize="12" Margin="0,6,0,0" TextWrapping="Wrap"/>
         </StackPanel>
         <StackPanel Grid.Row="6" VerticalAlignment="Bottom">

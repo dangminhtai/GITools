@@ -6,6 +6,8 @@ FPS: nhập số rồi bấm **Áp dụng FPS**.
 
 Checkbox **Điều khiển camera bằng phím** mặc định có tick. App tự gửi bật một lần khi backend của phiên game sẵn sàng; nếu chưa có backend thì hiển thị đang chờ. Bỏ tick gửi tắt; **F8** cũng tắt và checkbox đồng bộ theo trạng thái backend, không tự bật lại trong phiên đó. Đóng app điều khiển gửi yêu cầu dừng.
 
+Nút **Tắt / Reset camera** luôn có riêng: bỏ tick và gửi STOP để trả quyền cập nhật pose cho gameplay, kể cả khi checkbox đã bỏ tick. Đây không phải khôi phục một tọa độ snapshot cũ hoặc reset FOV/FPS.
+
 Camera dùng ↑/↓ tiến/lùi theo hướng camera, ←/→ sang trái/phải; **Page Up/Page Down** lên/xuống theo trục cao của scene. Ô tốc độ tính bằng đơn vị scene/giây, được đọc khi bật; đổi tốc độ rồi bỏ tick/tick lại để áp dụng. WASD và Q/E dành cho gameplay. Alt+Tab ngừng nhận phím, vẫn giữ vị trí camera. Phím camera chỉ nhận khi game có focus và con trỏ ẩn. Khung nhập XYZ thủ công đã bỏ khỏi UI.
 
 
