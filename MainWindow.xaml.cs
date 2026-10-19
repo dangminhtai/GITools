@@ -14,7 +14,11 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer argumentTimer = new() { Interval = TimeSpan.FromMilliseconds(250) };
     private bool argumentRefreshing, argumentClosing, argumentCloseComplete;
     private Task? argumentCommand;
-    private string? coordinateError;
+    private string? cameraError;
+    private (int Pid, long Session)? cameraSession;
+    private (int Pid, long Session, string Nonce)? keyboardRequest;
+    private bool keyboardAutoAttempted;
+    private bool keyboardEventsReady, syncingKeyboardCheckbox;
     private readonly DispatcherTimer debounce = new() { Interval = TimeSpan.FromMilliseconds(120) };
     private bool ready, closing;
     private long revision, appliedRevision;
@@ -28,6 +32,7 @@ public partial class MainWindow : Window
         fpsConfig = new FpsConfig(index >= 0 && index + 1 < args.Length ? args[index + 1] : FovConfig.DefaultPath);
         argumentTrial = new ArgumentTrialClient(index >= 0 && index + 1 < args.Length ? args[index + 1] : FovConfig.DefaultPath);
         InitializeComponent();
+        keyboardEventsReady = true;
         argumentTimer.Tick += async (_, _) => await RefreshArgumentTrial();
         debounce.Tick += async (_, _) => { debounce.Stop(); await ApplyLatest(); };
     }
@@ -62,125 +67,109 @@ public partial class MainWindow : Window
         {
             var state = await Task.Run(argumentTrial.Read);
             if (argumentClosing || argumentCommand != null) return;
-            CoordinateControls.IsEnabled = state.Bindings.Length == 1 && state.SupportsCustomPosition && state.Bindings[0].Position.Length == 3;
-            KeyboardStart.IsEnabled = state.SupportsKeyboard && state.Bindings.Length == 1;
-            ArgTrialStop.IsEnabled = true;
+            var session = (state.Pid, state.Session);
+            if (cameraSession != session)
+            {
+                cameraSession = session;
+                keyboardRequest = null;
+                keyboardAutoAttempted = false;
+                cameraError = null;
+            }
+            // Initial check is user intent, not an assertion that the backend is active.
+            // Send once when ready; a rejection or F8 must not create a re-arm loop.
+            if (KeyboardStart.IsChecked == true && !keyboardAutoAttempted && state.SupportsKeyboard && state.Bindings.Length == 1)
+            {
+                keyboardAutoAttempted = true;
+                await EnableKeyboard();
+                return;
+            }
+            if (keyboardRequest is { } request && request.Pid == state.Pid && request.Session == state.Session &&
+                request.Nonce == state.Nonce && state.Phase is "stopped" or "completed" or "rejected")
+            {
+                SetKeyboardChecked(false);
+                keyboardRequest = null;
+            }
             ArgTrialStatus.Text = state.Phase switch
             {
                 "waiting_focus" => "Chuyển về game, ẩn con trỏ trong 15 giây để bắt đầu.",
-                "active" when state.ArgumentKind == "keyboard" => "Đang bật mũi tên. F8 hoặc Tắt camera để về gameplay.",
-                "active" => "Đang giữ camera. Bấm Tắt để về gameplay.",
+                "active" when state.ArgumentKind == "keyboard" => "Đang bật điều khiển phím. Bỏ tick hoặc F8 để tắt.",
+                "active" => "Đang giữ camera. Bỏ tick để tắt.",
                 "rejected" => "Backend từ chối: " + state.Reason,
                 "completed" or "stopped" when state.LastOverride > 0 && state.LastOriginal > state.LastOverride
                     => "Đã trả argument gốc. Kiểm tra camera đã trở lại bình thường.",
                 "completed" or "stopped" => "Đã dừng: " + state.Reason,
-                _ => state.Bindings.Length == 1 ? "Chọn tọa độ và bật giữ camera." : "Đang chờ đích pose duy nhất."
+                _ => KeyboardStart.IsChecked == true ? "Đang chờ backend camera sẵn sàng để bật." : "Điều khiển camera đã tắt."
             };
-            if (coordinateError != null) ArgTrialStatus.Text = coordinateError;
+            if (cameraError != null) ArgTrialStatus.Text = cameraError;
         }
         catch
         {
             if (!argumentClosing && argumentCommand == null)
             {
-                ArgTrialStop.IsEnabled = false;
-                CoordinateControls.IsEnabled = false;
-                KeyboardStart.IsEnabled = false;
-                ArgTrialStatus.Text = "Cần game chạy với plugin bản thử camera.";
+                ArgTrialStatus.Text = KeyboardStart.IsChecked == true
+                    ? "Đã chọn bật; đang chờ game và backend camera."
+                    : "Điều khiển camera đã tắt.";
             }
         }
         finally { argumentRefreshing = false; }
     }
 
-    private async void ArgumentTrialStopClick(object sender, RoutedEventArgs e)
+    private void SetKeyboardChecked(bool value)
     {
-        if (argumentClosing || argumentCommand != null) return;
-        coordinateError = null;
-        ArgTrialStop.IsEnabled = CoordinateControls.IsEnabled = KeyboardStart.IsEnabled = false;
+        syncingKeyboardCheckbox = true;
+        try { KeyboardStart.IsChecked = value; }
+        finally { syncingKeyboardCheckbox = false; }
+    }
+
+    private async void KeyboardToggleChanged(object sender, RoutedEventArgs e)
+    {
+        if (!keyboardEventsReady || syncingKeyboardCheckbox || argumentClosing || argumentCommand != null) return;
+        cameraError = null;
+        if (KeyboardStart.IsChecked == true)
+        {
+            keyboardAutoAttempted = false;
+            await RefreshArgumentTrial();
+            return;
+        }
+        KeyboardStart.IsEnabled = false;
         try
         {
             argumentCommand = Task.Run(() => argumentTrial.Stop());
             await argumentCommand;
-            ArgTrialStatus.Text = "Đã gửi Tắt camera.";
+            keyboardRequest = null;
+            ArgTrialStatus.Text = "Đã gửi tắt camera.";
         }
-        catch (Exception ex) { ArgTrialStatus.Text = coordinateError = ex.Message; }
-        finally { argumentCommand = null; }
+        catch (Exception ex)
+        {
+            // With no session/request, an unchecked offline checkbox simply cancels pending activation.
+            if (keyboardRequest != null) ArgTrialStatus.Text = cameraError = ex.Message;
+            else ArgTrialStatus.Text = "Điều khiển camera đã tắt.";
+        }
+        finally { argumentCommand = null; KeyboardStart.IsEnabled = !argumentClosing; }
     }
 
-    private async void KeyboardStartClick(object sender, RoutedEventArgs e)
+    private async Task EnableKeyboard()
     {
         if (argumentClosing || argumentCommand != null) return;
-        coordinateError = null;
+        cameraError = null;
         if (!double.TryParse(KeyboardSpeed.Text, System.Globalization.NumberStyles.Float,
                 System.Globalization.CultureInfo.InvariantCulture, out var speed) || !double.IsFinite(speed) || speed <= 0)
         {
-            ArgTrialStatus.Text = coordinateError = "Nhập tốc độ dương, dùng dấu chấm thập phân.";
+            ArgTrialStatus.Text = cameraError = "Nhập tốc độ dương, dùng dấu chấm thập phân.";
+            SetKeyboardChecked(false);
             return;
         }
-        KeyboardStart.IsEnabled = CoordinateControls.IsEnabled = ArgTrialStop.IsEnabled = false;
+        KeyboardStart.IsEnabled = false;
         try
         {
-            argumentCommand = Task.Run(() => argumentTrial.StartKeyboard(speed));
+            var request = Task.Run(() => argumentTrial.StartKeyboard(speed));
+            argumentCommand = request;
             await argumentCommand;
-            ArgTrialStatus.Text = "Đã gửi bật phím mũi tên. Quay về game và ẩn con trỏ để di chuyển.";
+            keyboardRequest = await request;
+            ArgTrialStatus.Text = "Đã gửi bật điều khiển phím; đang chờ backend xác nhận.";
         }
-        catch (Exception ex) { ArgTrialStatus.Text = coordinateError = ex.Message; }
-        finally { argumentCommand = null; }
-    }
-
-    private void CoordinateModeChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
-    {
-        coordinateError = null;
-        if (CoordinateX != null && CoordinateY != null && CoordinateZ != null)
-            CoordinateX.Text = CoordinateY.Text = CoordinateZ.Text = "0";
-    }
-
-    private async void ReadCoordinatesClick(object sender, RoutedEventArgs e)
-    {
-        if (argumentClosing || argumentCommand != null) return;
-        coordinateError = null;
-        CoordinateControls.IsEnabled = false;
-        try
-        {
-            var read = Task.Run(argumentTrial.Read); argumentCommand = read;
-            var state = await read;
-            if (argumentClosing) return;
-            if (!state.SupportsCustomPosition || state.Bindings.Length != 1 || state.Bindings[0].Position.Length != 3)
-                throw new InvalidOperationException("Chưa có XYZ camera hiện tại.");
-            CoordinateMode.SelectedIndex = 0;
-            var position = state.Phase == "active" && state.LastOverride > 0 &&
-                state.ArgumentKind is "keyboard" or "custom_position" &&
-                state.AppliedPosition.Length == 3 && state.AppliedPosition.All(double.IsFinite)
-                ? state.AppliedPosition : state.Bindings[0].Position;
-            CoordinateX.Text = position[0].ToString("R", System.Globalization.CultureInfo.InvariantCulture);
-            CoordinateY.Text = position[1].ToString("R", System.Globalization.CultureInfo.InvariantCulture);
-            CoordinateZ.Text = position[2].ToString("R", System.Globalization.CultureInfo.InvariantCulture);
-            ArgTrialStatus.Text = "Đã lấy XYZ camera theo scene hiện tại.";
-        }
-        catch (Exception ex) { ArgTrialStatus.Text = coordinateError = ex.Message; }
-        finally { argumentCommand = null; }
-    }
-
-    private async void ApplyCoordinatesClick(object sender, RoutedEventArgs e)
-    {
-        if (argumentClosing || argumentCommand != null) return;
-        coordinateError = null;
-        static double Number(string text)
-        {
-            if (!double.TryParse(text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var value) || !double.IsFinite(value))
-                throw new ArgumentException("Nhập XYZ là số hữu hạn, dùng dấu chấm thập phân.");
-            return value;
-        }
-        try
-        {
-            var x = Number(CoordinateX.Text); var y = Number(CoordinateY.Text); var z = Number(CoordinateZ.Text);
-            var offset = CoordinateMode.SelectedIndex == 1;
-            CoordinateControls.IsEnabled = ArgTrialStop.IsEnabled = KeyboardStart.IsEnabled = false;
-            argumentCommand = Task.Run(() => argumentTrial.StartPosition(x, y, z, offset));
-            await argumentCommand;
-            ArgTrialStatus.Text = "Đã gửi XYZ. Camera giữ đến khi bấm Tắt.";
-        }
-        catch (Exception ex) { ArgTrialStatus.Text = coordinateError = ex.Message; }
-        finally { argumentCommand = null; }
+        catch (Exception ex) { SetKeyboardChecked(false); ArgTrialStatus.Text = cameraError = ex.Message; }
+        finally { argumentCommand = null; KeyboardStart.IsEnabled = !argumentClosing; }
     }
 
     private async void ApplyFpsClick(object sender, RoutedEventArgs e)
@@ -252,8 +241,6 @@ public partial class MainWindow : Window
             argumentClosing = true;
             argumentTimer.Stop();
             KeyboardStart.IsEnabled = false;
-            ArgTrialStop.IsEnabled = false;
-            CoordinateControls.IsEnabled = false;
             if (argumentCommand != null) { try { await argumentCommand; } catch { } }
             try { await Task.Run(() => argumentTrial.Stop(onlyOwnSession: true)); } catch { }
             argumentCloseComplete = true;

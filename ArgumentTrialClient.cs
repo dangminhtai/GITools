@@ -99,7 +99,7 @@ public sealed class ArgumentTrialClient(string configPath)
         ownSession = null;
     }
 
-    public void StartKeyboard(double speed)
+    public (int Pid, long Session, string Nonce) StartKeyboard(double speed)
     {
         if (!double.IsFinite(speed) || speed <= 0 || speed > float.MaxValue)
             throw new ArgumentException("Tốc độ phải là số dương hữu hạn.");
@@ -107,8 +107,10 @@ public sealed class ArgumentTrialClient(string configPath)
         if (!state.SupportsKeyboard || state.Bindings.Length != 1)
             throw new InvalidOperationException("Cần plugin hỗ trợ di chuyển bằng phím và một đích camera.");
         var b = state.Bindings[0];
-        Publish(FormattableString.Invariant($"GCTARGMOVE2 {state.Pid} {state.Session} {b.Owner} {b.Thread} {b.Target} {b.Camera} {Guid.NewGuid():N} {speed:R}\n"));
+        var nonce = Guid.NewGuid().ToString("N");
+        Publish(FormattableString.Invariant($"GCTARGMOVE2 {state.Pid} {state.Session} {b.Owner} {b.Thread} {b.Target} {b.Camera} {nonce} {speed:R}\n"));
         ownSession = (state.Pid, state.Session);
+        return (state.Pid, state.Session, nonce);
     }
 
     public void StartPosition(double x, double y, double z, bool offset)

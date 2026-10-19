@@ -4,9 +4,10 @@ Mở `App/GCT.Fov.exe`. Kéo thanh FOV là tự gửi, không cần bấm Apply.
 
 FPS: nhập số rồi bấm **Áp dụng FPS**.
 
-Camera: bấm **Bật mũi tên** để dùng ↑/↓ tiến/lùi theo hướng camera, ←/→ sang trái/phải. **Page Up/Page Down** lên/xuống theo trục cao của scene. Ô tốc độ tính bằng đơn vị scene/giây. WASD và Q/E dành cho gameplay; **F8** hoặc **Tắt camera** ngừng override. Alt+Tab ngừng nhận phím, vẫn giữ vị trí camera. Phím camera chỉ nhận khi game có focus và con trỏ ẩn.
+Checkbox **Điều khiển camera bằng phím** mặc định có tick. App tự gửi bật một lần khi backend của phiên game sẵn sàng; nếu chưa có backend thì hiển thị đang chờ. Bỏ tick gửi tắt; **F8** cũng tắt và checkbox đồng bộ theo trạng thái backend, không tự bật lại trong phiên đó. Đóng app điều khiển gửi yêu cầu dừng.
 
-Tọa độ camera: chọn **Vị trí XYZ (scene)**, bấm **Lấy XYZ hiện tại** rồi sửa X/Y/Z; hoặc chọn **Độ lệch XYZ** và nhập lượng dịch thêm. **Bật / cập nhật XYZ** giữ điểm đích đến khi tắt, không giới hạn 3 giây hay khoảng cách 5 đơn vị. Độ lệch tính một lần từ vị trí khi bắt đầu, không cộng dồn mỗi frame. Đóng app điều khiển cũng gửi yêu cầu dừng. GUI không tự chạy loader hoặc nạp DLL.
+Camera dùng ↑/↓ tiến/lùi theo hướng camera, ←/→ sang trái/phải; **Page Up/Page Down** lên/xuống theo trục cao của scene. Ô tốc độ tính bằng đơn vị scene/giây, được đọc khi bật; đổi tốc độ rồi bỏ tick/tick lại để áp dụng. WASD và Q/E dành cho gameplay. Alt+Tab ngừng nhận phím, vẫn giữ vị trí camera. Phím camera chỉ nhận khi game có focus và con trỏ ẩn. Khung nhập XYZ thủ công đã bỏ khỏi UI.
+
 
 Dùng config hiện có: `C:\GCT\Backends\z3lx-7.1.0\plugin_config.json`.
 Game cần plugin FOV đang chạy để hình ảnh thay đổi. App không tự nạp plugin.
@@ -40,6 +41,7 @@ Backend kiểm hash executable `08A3086D5F3FE695F01DAB61EFA42E442006B18E5E475B25
 
 - Release plugin MSVC 19.43 và desktop publish: **PASS** trên máy phát triển. Hướng dẫn clone/build ở checkout mới chưa chạy độc lập.
 - Kiểm tra WPF/config FOV/FPS: **PASS**. FOV/FPS source giữ nguyên trong các thay đổi camera.
+- Checkbox: **PASS** tick mặc định, bỏ tick/tick lại khi offline không gửi request; kiểm tra với backend của phiên game thật xác nhận bật mặc định → bỏ tick nhận `stopped/user_stop` → tick lại nhận `active/keyboard` với nonce mới. Đây là xác nhận luồng điều khiển, không phải kiểm thử hình ảnh hoặc phím di chuyển. Script WPF/config: `powershell -File .\verification\check-fps.ps1` sau khi publish desktop.
 - Các phép thử XYZ và yaw/pitch ngắn hạn trước đây: **USER CONFIRMED** có tác dụng trong game; không thay thế kiểm chứng bản mới.
 - Bản sáu hướng đã cài local, config FOV/FPS không đổi; di chuyển phím, tách input nhân vật và OFF/restore của bản này: **NOT TESTED** trực tiếp.
 - Quaternion XYZW và hướng di chuyển vẫn cần đối chiếu live; chưa chứng minh last-writer, render binding hoặc lifecycle qua mọi lần đổi scene. Đổi owner/thread/target, pose không hợp lệ hoặc lỗi IPC sẽ dừng override.

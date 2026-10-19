@@ -1,7 +1,7 @@
 <Window x:Class="GctFov.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="GCT · FOV" Width="470" Height="680" ResizeMode="NoResize"
+        Title="GCT · FOV" Width="470" Height="500" ResizeMode="NoResize"
         WindowStartupLocation="CenterScreen" Background="#141821"
         Foreground="#F3F5FA" FontFamily="Segoe UI" FontSize="14"
         Loaded="WindowLoaded" Closing="WindowClosing">
@@ -42,31 +42,14 @@
         </StackPanel>
         <StackPanel Grid.Row="4" Margin="0,0,0,14">
             <StackPanel Orientation="Horizontal">
-                <Button x:Name="KeyboardStart" Content="Bật mũi tên" Click="KeyboardStartClick" IsEnabled="False" Padding="10,5"/>
+                <CheckBox x:Name="KeyboardStart" Content="Điều khiển camera bằng phím" IsChecked="True"
+                          Checked="KeyboardToggleChanged" Unchecked="KeyboardToggleChanged" VerticalAlignment="Center"/>
                 <TextBlock Text="Tốc độ" VerticalAlignment="Center" Margin="10,0,6,0"/>
                 <TextBox x:Name="KeyboardSpeed" Text="3" Width="60" Padding="5,3"/>
             </StackPanel>
             <TextBlock Text="↑↓←→ di chuyển · PgUp lên / PgDn xuống · F8 tắt" Foreground="#BCC5D7" FontSize="12" Margin="0,6,0,0" TextWrapping="Wrap"/>
         </StackPanel>
         <StackPanel Grid.Row="5" Margin="0,0,0,14">
-        <StackPanel x:Name="CoordinateControls" IsEnabled="False">
-            <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                <ComboBox x:Name="CoordinateMode" Width="185" SelectedIndex="0" SelectionChanged="CoordinateModeChanged">
-                    <ComboBoxItem Content="Vị trí XYZ (scene)"/><ComboBoxItem Content="Độ lệch XYZ"/>
-                </ComboBox>
-                <Button Content="Lấy XYZ hiện tại" Click="ReadCoordinatesClick" Padding="10,4" Margin="8,0,0,0"/>
-            </StackPanel>
-            <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                <StackPanel Margin="0,0,8,0"><TextBlock Text="X"/><TextBox x:Name="CoordinateX" Text="0" Width="110" Padding="5,3"/></StackPanel>
-                <StackPanel Margin="0,0,8,0"><TextBlock Text="Y"/><TextBox x:Name="CoordinateY" Text="0" Width="110" Padding="5,3"/></StackPanel>
-                <StackPanel><TextBlock Text="Z"/><TextBox x:Name="CoordinateZ" Text="0" Width="110" Padding="5,3"/></StackPanel>
-            </StackPanel>
-            <StackPanel Orientation="Horizontal">
-                <Button Content="Bật / cập nhật XYZ" Click="ApplyCoordinatesClick" Padding="10,5"/>
-            </StackPanel>
-        </StackPanel>
-            <Button x:Name="ArgTrialStop" Content="Tắt camera" Click="ArgumentTrialStopClick"
-                    HorizontalAlignment="Left" IsEnabled="False" Padding="12,5" Margin="0,8,0,0"/>
             <TextBlock x:Name="ArgTrialStatus" Foreground="#BCC5D7" FontSize="12" Margin="0,6,0,0" TextWrapping="Wrap"/>
         </StackPanel>
         <StackPanel Grid.Row="6" VerticalAlignment="Bottom">

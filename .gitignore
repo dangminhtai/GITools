@@ -1,7 +1,8 @@
 bin/
 obj/
 App/
-verification/
+verification/*
+!verification/check-fps.ps1
 
 # Machine-local runtime captures, plugin binaries and deployment state
 FreeCamTrial/
